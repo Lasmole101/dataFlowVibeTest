@@ -1,0 +1,60 @@
+[package]
+name        = "dataFlowClaude"
+version     = "0.1.0"
+edition     = "2021"
+authors     = []
+description = "Data flow diagramming tool"
+license     = "MIT"
+
+[[bin]]
+name = "dataFlowClaude"
+path = "src/main.rs"
+
+# ---------------------------------------------------------------------------
+# Runtime dependencies
+# ---------------------------------------------------------------------------
+[dependencies]
+
+egui = "0.29"
+
+# eframe: base features for all platforms. The Linux target block below adds
+# x11/wayland. Cargo merges feature lists from both blocks automatically.
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",        # OpenGL renderer (works via mesa/llvmpipe in WSL)
+    "persistence", # window state saved between runs
+] }
+
+uuid      = { version = "1",    features = ["v4", "serde"] }
+quick-xml = { version = "0.36", features = ["serialize"] }
+serde     = { version = "1",    features = ["derive"] }
+thiserror = "2"
+rfd       = "0.15"
+
+# ---------------------------------------------------------------------------
+# Linux: add X11 + Wayland surface backends (WSL and native Linux).
+# Cargo merges these features with the [dependencies] entry above.
+# ---------------------------------------------------------------------------
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+    "x11",
+    "wayland",
+] }
+
+# ---------------------------------------------------------------------------
+# Development / test dependencies
+# ---------------------------------------------------------------------------
+[dev-dependencies]
+pretty_assertions = "1"
+
+# ---------------------------------------------------------------------------
+# Release profile — small binary, full optimisation
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = "symbols"
