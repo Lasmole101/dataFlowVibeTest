@@ -1,15 +1,6 @@
 //! Entry point for the Data Flow Diagramming Tool.
 //!
-//! Initialises [`eframe`] and hands control to [`app::AppState`].
-
-#![warn(clippy::all, missing_docs)]
-
-mod app;
-mod model;
-mod persistence;
-mod ui;
-mod undo;
-mod validation;
+//! All modules are declared in `lib.rs`.  This file only contains `main`.
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -21,8 +12,8 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "dataFlowClaude",
+        "dataflow",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::AppState::new(cc)))),
+        Box::new(|cc| Ok(Box::new(dataFlowClaude::app::AppState::new(cc)))),
     )
 }

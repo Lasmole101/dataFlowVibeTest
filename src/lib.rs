@@ -1,4 +1,7 @@
-// Create a library so that the tests directory has access
+//! Data Flow Diagramming Tool — library root.
+//!
+//! Exposes all modules publicly so that integration tests in `tests/` can
+//! import from the `dataflow` crate.  The binary entry point is in `main.rs`.
 
 pub mod app;
 pub mod model;
