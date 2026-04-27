@@ -243,6 +243,30 @@ The tree pane displays error and warning badges on diagrams that contain unresol
 
 A single global undo/redo stack covers all changes across all diagram levels. A compound action (e.g. editing a parent process I/O that cascades into a sub-diagram boundary update) is a single undoable step.
 
+#### Implementation decisions (phase 4)
+
+**`Command` trait is fallible.** Both `apply` and `undo` return `Result<(), CommandError>` where `CommandError = Box<dyn Error + Send + Sync>`. A command whose `apply` fails is **not pushed** onto the stack — `UndoStack::execute` only stores a command after successful application. A failed `undo` discards the command from the `past` stack rather than pushing it to `future`, since the project state may be inconsistent.
+
+**`UndoStack::execute` replaces the old `push` method.** The new name makes the intent explicit: execute applies and records, distinguishing it from internal stack management.
+
+**`CompoundCommand::apply` rolls back on partial failure.** If sub-command `n` fails, sub-commands `0..n-1` are undone in reverse order before the error is returned. This keeps the project in its pre-apply state. `undo` continues reversing all sub-commands even if one fails, collecting only the first error.
+
+**Snapshot-based concrete commands.** Every command stores everything needed for both directions up-front — no inverse computation at undo time. `DeleteNode` stores the full `Node` struct and its canvas position. `DeleteStream` stores the full `Stream`. `EditNodeSpec` and `EditStreamSpec` store before/after `TypeSpec` snapshots. `EditStreamGroup` stores before/after `StreamGroup` snapshots.
+
+**`EditNodeSpec` uses a `NodeSpecSide` enum** (`Input` / `Output`) to avoid two separate command types for editing the two specs on a node.
+
+**`DeleteNode` is an atomic command** that expects connected streams to already be removed. The UI layer wraps it in a `CompoundCommand` with the stream deletions. This keeps each command minimal and composable.
+
+**`CreateStreamGroup` pre-allocates its UUID.** The `group_id` field is set before `execute` is called so that undo and redo both operate on the same UUID, keeping group identity stable across the history.
+
+**`RenameType` patches all diagram specs.** `DataDictionary::rename` patches composite type definitions; `RenameType::apply` additionally scans every node and stream in every diagram and updates `type_ref` strings directly. `undo` reverses the same scan. This is the authoritative cascade — `ValidationCache::on_type_renamed` is called separately by the app layer after the command executes.
+
+**`CreateSubDiagram::undo` removes by the currently-linked sub-diagram ID**, not the pre-allocated `sub_diagram_id` field. This handles the redo case where `create_sub_diagram` may assign a different UUID (because boundary node UUIDs regenerate). A full snapshot approach will be used in a production hardening pass.
+
+**`err()` private helper resolves type-inference ambiguity.** `format!("{e}").into()` in `map_err` closures is ambiguous when `?` is used — the compiler cannot pick among multiple `Into<CommandError>` impls. The `err(msg: impl Display) -> CommandError` helper makes the target type explicit at one site.
+
+**Concrete commands implemented**: `AddNode`, `DeleteNode`, `MoveNode`, `RenameNode`, `EditNodeSpec`, `AddStream`, `DeleteStream`, `EditStreamSpec`, `CreateStreamGroup`, `DeleteStreamGroup`, `EditStreamGroup`, `AddPrimitiveType`, `AddCompositeType`, `DeleteType`, `RenameType`, `CreateSubDiagram`, `OrphanSubDiagram`, `AttachOrphan`.
+
 ---
 
 ## 6. Diagram Decomposition
@@ -321,6 +345,28 @@ The schema covers:
 
 The data dictionary is saved as part of the project file. It may also be exported and imported independently.
 
+#### Implementation decisions (phase 5a)
+
+**Flat diagram list, not a nested tree.** All diagrams (root, sub-diagrams, orphaned) are stored as siblings inside `<diagrams>`. Each `<diagram>` carries a `parent_process_id` attribute (omitted for the root and orphaned diagrams). The reader reconstructs the logical tree from those pointers. This avoids recursive serialisation and matches the in-memory `HashMap<Uuid, Diagram>` representation exactly.
+
+**Optional attributes are omitted when absent.** `sub_diagram_id`, `parent_process_id`, and stream `group_id` are not written when `None`. Boolean flags that default to `false` (`is_boundary`, `is_dangling`) are omitted when false; the deserialiser treats absence as `false`.
+
+**Node positions are stored as `x` and `y` attributes on `<node>`**, not in a separate `<positions>` section. This keeps all node data co-located and avoids a second ID-keyed lookup pass during deserialisation.
+
+**Stream group members are `<member stream_id="..."/>` children of `<group>`**, not a comma-delimited attribute. This avoids UUID list parsing and makes the format more readable and extensible.
+
+**Orphaned diagram IDs are recorded in a dedicated `<orphaned>` element** as `<ref id="..."/>` children, separate from the `<diagrams>` list. This makes the orphaned set explicit without relying on the absence of a `parent_process_id`.
+
+**Empty containers are written as self-closing elements** (e.g. `<streams/>`). This keeps minimal documents compact.
+
+**`NodeKind` serialises as `"Source"`, `"Sink"`, `"Process"`** — defined as `NODE_KIND_*` constants. The deserialiser rejects any other value.
+
+**`ATTR_SCHEMA_VERSION` replaces the old `ATTR_VERSION` constant** from the scaffold. The new name is unambiguous and matches the XML attribute string `"schema_version"` exactly. `ATTR_ROOT_DIAGRAM_ID` is new — the root diagram UUID must be stored explicitly since the flat diagram list has no implied ordering.
+
+**`ATTR_STREAM_ID` is added** for `<member>` elements inside `<group>`, distinguishing a stream reference from the group's own `id` attribute.
+
+**`BOOL_TRUE` and `BOOL_FALSE` constants** are defined for use by the serialiser/deserialiser. `BOOL_FALSE` is not written (absence implies false) but is defined for use in deserialiser comparisons to avoid string literals.
+
 ---
 
 ## 8. Additional Features
@@ -355,4 +401,5 @@ The following are explicitly not part of this project:
 | 4 | Copy/paste and multi-select: in scope or deferred? | Medium |
 | 6 | Window state persistence: tree pane width, last open diagram, window size | Low |
 | 7 | Multi-select and group-move of nodes | Low |
+
 

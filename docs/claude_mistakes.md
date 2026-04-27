@@ -22,4 +22,10 @@
     |
 197 |             if *v > 0 {
     |                     ^ expected `&i64`, found integer
-    |   |                 ^^^^^^^^^^^^^^^^ positional arguments must be before named arguments
+
+### Type annotation missing
+ error[E0283]: type annotations needed
+   --> src/undo/commands.rs:686:22
+    |
+686 |             .map_err(|e| format!("{e}").into())?;
+    |                      ^^^                ---- type must be known at this point   |   |                 ^^^^^^^^^^^^^^^^ positional arguments must be before named arguments

@@ -5,4 +5,5 @@
 //! cascading the sub-diagram boundary update) are committed as a single
 //! undoable step.
 
+pub mod commands;
 pub mod history;
