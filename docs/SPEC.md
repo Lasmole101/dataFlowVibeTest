@@ -267,6 +267,22 @@ A single global undo/redo stack covers all changes across all diagram levels. A 
 
 **Concrete commands implemented**: `AddNode`, `DeleteNode`, `MoveNode`, `RenameNode`, `EditNodeSpec`, `AddStream`, `DeleteStream`, `EditStreamSpec`, `CreateStreamGroup`, `DeleteStreamGroup`, `EditStreamGroup`, `AddPrimitiveType`, `AddCompositeType`, `DeleteType`, `RenameType`, `CreateSubDiagram`, `OrphanSubDiagram`, `AttachOrphan`.
 
+#### Implementation decisions (phase 6a — AppState and layout)
+
+**`AppState` owns dialog state.** All four modal dialog structs (`RenameDialog`, `CreateGroupDialog`, `SetSubDiagramDialog`, `ConfirmDeleteDialog`) are bundled in `DialogState` and owned by `AppState`, so their text buffers and open-flags survive between egui frames. They are not created fresh each frame.
+
+**`todo!()` UI stubs are not called from `update()`.** `ui::toolbar`, `ui::tree_pane`, `ui::canvas`, `ui::spec_panel`, and `ui::dictionary_panel` all have `todo!()` bodies and will be implemented in Phases 7–8. `app.rs` contains inline render functions (`render_toolbar`, `render_tree_pane`, `render_canvas_placeholder`, etc.) that provide real behaviour without calling the stub functions. When the Phase 7 implementations are complete, the inline functions will be replaced with calls to the `ui::*::show()` functions.
+
+**egui panel registration order.** Panels must be registered top-to-bottom, left-to-right, with `CentralPanel` last (it takes all remaining space). Order: `TopBottomPanel::top` (toolbar) → `TopBottomPanel::bottom` (status bar) → `SidePanel::left` (tree pane) → `SidePanel::right` (spec/dictionary) → `CentralPanel` (canvas).
+
+**`tree_pane_width` persists on `AppState`.** The resizable side panel's current width is stored each frame so it survives panel hide/show cycles.
+
+**`dirty` flag and window title.** `AppState.dirty` is set by every command execution and cleared on save. The window title is updated each frame via `ctx.send_viewport_cmd(ViewportCommand::Title(...))` to reflect the dirty state (`[*]` suffix) and current filename.
+
+**`status_message: Option<String>`** is consumed and cleared each frame by the status bar renderer, giving one-frame transient messages without a timer.
+
+**`active_panel` toggle semantics.** Clicking the same panel button twice closes it (sets `ActivePanel::None`). This is implemented by the `if active_panel == X { None } else { X }` pattern in the menu handlers.
+
 ---
 
 ## 6. Diagram Decomposition
@@ -401,5 +417,7 @@ The following are explicitly not part of this project:
 | 4 | Copy/paste and multi-select: in scope or deferred? | Medium |
 | 6 | Window state persistence: tree pane width, last open diagram, window size | Low |
 | 7 | Multi-select and group-move of nodes | Low |
+
+
 
 
