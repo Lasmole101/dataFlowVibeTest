@@ -37,6 +37,7 @@ use crate::{
     model::project::Project,
     ui::dialogs::{ConfirmDeleteDialog, CreateGroupDialog, RenameDialog, SetSubDiagramDialog},
     ui::dictionary_panel::DictionaryPanelState,
+    ui::spec_panel::SpecPanelState,
     undo::history::UndoStack,
     validation::validator::ValidationCache,
 };
@@ -88,6 +89,8 @@ pub struct DialogState {
     pub confirm_delete: ConfirmDeleteDialog,
     /// Persistent state for the data dictionary editor panel.
     pub dictionary: DictionaryPanelState,
+    /// Persistent state for the spec editor panel.
+    pub spec: SpecPanelState,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,19 +313,7 @@ fn render_right_panel(state: &mut AppState, ui: &mut Ui) {
         }
         ActivePanel::Spec(id) => {
             let id = *id;
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Spec Editor");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
-                            state.active_panel = ActivePanel::None;
-                        }
-                    });
-                });
-                ui.separator();
-                ui.label(format!("Component: {}", id.hyphenated()));
-                ui.label("Spec editor — Phase 7b.");
-            });
+            crate::ui::spec_panel::show(state, id, ui);
         }
     }
 }

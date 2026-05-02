@@ -335,6 +335,26 @@ A single global undo/redo stack covers all changes across all diagram levels. A 
 
 **`is_type_in_use` also checks composite definitions.** A type referenced only by another composite (not by any node/stream) is still "in use" and warrants a confirmation before deletion. The composite type's spec entries are scanned alongside node and stream specs.
 
+#### Implementation decisions (phase 7b — spec panel)
+
+**`SpecPanelState` lives in `DialogState::spec`.** Name-edit buffer, picker-open flags, and the current component ID are stored across frames alongside the dictionary panel state. The panel detects selection changes by comparing `current_id` to `target_id` each frame and resets when they differ.
+
+**Every `+`/`−` click dispatches a command immediately.** Each count change is individually undoable. The "before" snapshot is the spec as it existed at the start of the frame (read before any mutation); the "after" snapshot is computed by cloning and applying the action in memory.
+
+**`SpecTarget` enum drives command construction.** The three cases — `NodeInput`, `NodeOutput`, `Stream` — map cleanly to `EditNodeSpec(Input)`, `EditNodeSpec(Output)`, and `EditStreamSpec`. This avoids branching in `apply_spec_action` on anything other than the target type.
+
+**Type picker is an inline collapsible list**, not a popup window. "Add type…" button toggles `input_picker_open` / `output_picker_open`. Each available type name is a small button; clicking it dispatches the add action and closes the picker. Two separate picker-open flags are maintained so the input and output pickers can be independently open on a Process node.
+
+**`TypeSpec::add` merges duplicate type_refs.** Calling `after.add(1, &type_name)` on a spec that already contains `type_name` increments its count by 1 rather than creating a second entry, satisfying the spec §5.3 requirement "If the same type is added twice, the counts are merged."
+
+**Decrement to zero removes the entry entirely.** When count reaches 1 and `−` is clicked, the entry is removed from the spec. This matches `TypeSpec::remove` semantics.
+
+**Boundary nodes are fully read-only.** The name field shows a plain label (no ✎ button). Spec entries show `× count` in grey without `+`/`−` controls. The "Add type…" button is suppressed. The `read_only` parameter propagates from `is_boundary` through `show_spec_entries`.
+
+**Incremental validation is triggered after each spec change.** `ValidationCache::validate_incremental(changed_id, project)` is called after a successful command dispatch, re-validating the changed component and its direct neighbours without requiring a full project scan.
+
+**Streams are never read-only.** Stream type specs are always editable regardless of the nodes at either end. The stream panel displays a short UUID prefix instead of a name field since streams have no user-visible name.
+
 ---
 
 ## 6. Diagram Decomposition
