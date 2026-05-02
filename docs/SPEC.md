@@ -283,6 +283,58 @@ A single global undo/redo stack covers all changes across all diagram levels. A 
 
 **`active_panel` toggle semantics.** Clicking the same panel button twice closes it (sets `ActivePanel::None`). This is implemented by the `if active_panel == X { None } else { X }` pattern in the menu handlers.
 
+#### Implementation decisions (phase 6b — toolbar)
+
+**`ui::toolbar::show` supersedes the inline `render_toolbar` in `app.rs`.** The inline function body is replaced with a single delegation call `crate::ui::toolbar::show(state, ui)`. This is the migration pattern for all `render_*` inline functions in `app.rs` as each corresponding `ui::*::show()` is implemented.
+
+**Keyboard shortcuts are processed via `ctx.input_mut(|i| i.consume_shortcut(...))`** inside `handle_shortcuts`, called from `show()` after the menu bar. This fires shortcuts even when no menu is open. Shortcuts are consumed (not just checked) so they don't propagate further.
+
+**`action_*` functions are pure logic with no UI dependencies.** Each action is a free function taking `&mut AppState`. This makes them callable from both the menu and keyboard handlers without duplication, and testable in isolation.
+
+**File actions (Open, Save, Save As) are stubs** that post a status message. They will be wired to `rfd` (file picker) and `persistence::xml` in Phase 7. `action_save` delegates to `action_save_as` when no current file path is set.
+
+**Undo/redo calls `validate_full` after the stack operation.** After any undo or redo, the full validation cache is refreshed. This is slightly over-broad (incremental would be more efficient) but correct and simple; incremental post-undo validation will be optimised in Phase 7 when the canvas knows which components changed.
+
+**`menu_item()` helper** builds a `Button` with a tab-separated shortcut hint using egui's built-in right-alignment for the tab character. Empty shortcut string produces a plain button label.
+
+**Breadcrumb shows `filename › diagram_name`** in right-to-left layout so the diagram name sits closest to the icon buttons. The file name is taken from `current_file.file_name()`, not the full path, to keep the bar compact.
+
+#### Implementation decisions (phase 6c — tree pane)
+
+**Tree is built before rendering.** `build_tree()` collects all names, badges, and relationships into a `ProjectTree` value before any mutable borrows of `AppState`. This avoids borrow conflicts between reading `project` and writing `active_diagram_id` inside the same frame.
+
+**Sub-diagrams are nested under their parent process node, not under the parent diagram.** The tree shows: root diagram → process nodes (sorted by name) → sub-diagram (indented one further level). This matches the spec §5.4 hierarchy and gives the user the structural context of *which process* owns the sub-diagram.
+
+**Process node rows use `ui.label` not `ui.selectable_label`.** Process nodes are not navigable targets (you navigate to diagrams, not nodes). Clicking a process row has no effect; only the right-click context menu is active. A visual distinction (`⚙` vs `📄` icons, non-highlighted row) communicates this.
+
+**Diagram badges are computed locally, not in `ValidationCache`.** `diagram_badge()` iterates all node and stream UUIDs in a diagram and takes the worst `ValidationState`. This is a UI concern; adding per-diagram aggregation to `ValidationCache` would conflate presentation with validation logic.
+
+**`apply_badge_color` does not colour `Ok` items.** Returning `RichText` without `.color()` for `ValidationState::Ok` lets the egui theme apply its default text colour. Only Warning and Error entries get explicit colours. This makes themes (light/dark) work correctly without querying `ui.visuals()` in a free function.
+
+**Inline rename dialog bypasses the `todo!()` stub.** `dialogs::RenameDialog::show` is still `todo!()`. The tree pane renders an egui `Window` directly, storing state in `AppState::dialogs.rename` — the same fields the full dialog will use. The Phase 7 implementation replaces the inline `Window` with a call to `state.dialogs.rename.show(ctx)`.
+
+**Set-subdiagram dialog is rendered in `app.rs`, not `tree_pane.rs`.** The tree pane opens the dialog by setting `state.dialogs.set_subdiagram.open = true`. The `app.rs::render_set_subdiagram_dialog` function renders it as a floating `Window` over the full screen. This avoids the dialog being clipped by the side panel bounds.
+
+**Orphan list for set-subdiagram is collected before assigning.** `state.project.orphaned_diagram_ids.iter()...collect()` is stored in a local `Vec` before assigning to `state.dialogs.set_subdiagram.orphans`. This avoids a simultaneous immutable borrow of `state.project` and mutable borrow of `state.dialogs`.
+
+#### Implementation decisions (phase 7a — dictionary panel)
+
+**`DictionaryPanelState` lives in `DialogState::dictionary`.** All frame-persistent state for the dictionary editor (add-primitive input buffer, composite builder form, inline rename state, pending-delete name) is stored on `AppState` via the existing `DialogState` bag. This avoids adding a new field directly to `AppState` and keeps all per-panel state co-located.
+
+**Inline rename replaces the label in-place.** Clicking "Rename" switches the row from a `ui.label` to a `ui.text_edit_singleline` with OK/Cancel buttons. The edit buffer pre-filled with the current name. Enter confirms; Escape cancels. This avoids a modal dialog for a common operation and matches the tree pane's rename UX.
+
+**Duplicate-name error shown inline, not as a dialog.** When a duplicate name is entered for either add-primitive or rename, a red error label appears below the input immediately. The input remains open so the user can correct it.
+
+**Delete shows inline confirmation only when type is in use.** `is_type_in_use()` scans all node specs, stream specs, and composite definitions for a direct `type_ref` match. If in use, the "Delete" button becomes "In use — delete anyway? [Confirm] [Cancel]" inline. If not in use, deletion proceeds immediately. This avoids an unnecessary confirmation dialog for the common case.
+
+**`on_type_deleted` is called before `execute`.** The validation cache is notified while the type still exists in the dictionary, so it can scan specs to find referencing components and inject errors. The `DeleteType` command then removes the type. Calling after would mean the scan finds nothing.
+
+**Composite builder uses `egui::ComboBox` for type selection.** Each entry's type picker shows all current dictionary names as options. The first available type is used as the default for new entries. Empty dictionary → empty string default (error shown on submit).
+
+**`composite_summary` renders a one-line definition.** Each composite row shows `= 3×uint32_t, 2×char` in grey below its name, giving the user a quick overview without expanding the entry. This is purely display — no interaction.
+
+**`is_type_in_use` also checks composite definitions.** A type referenced only by another composite (not by any node/stream) is still "in use" and warrants a confirmation before deletion. The composite type's spec entries are scanned alongside node and stream specs.
+
 ---
 
 ## 6. Diagram Decomposition
@@ -417,7 +469,3 @@ The following are explicitly not part of this project:
 | 4 | Copy/paste and multi-select: in scope or deferred? | Medium |
 | 6 | Window state persistence: tree pane width, last open diagram, window size | Low |
 | 7 | Multi-select and group-move of nodes | Low |
-
-
-
-
