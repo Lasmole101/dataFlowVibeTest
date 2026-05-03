@@ -371,6 +371,24 @@ A single global undo/redo stack covers all changes across all diagram levels. A 
 
 **`ConfirmDeleteDialog` places the destructive "Delete" button on the left** in red, with "Cancel" to its right. This is the opposite of most confirmation dialogs but matches the destructive-action pattern where the primary action is visually prominent. The ⚠ icon is shown in amber. Escape always cancels.
 
+#### Implementation decisions (phase 8a — canvas drawing)
+
+**Diagram is cloned before `apply_badges`.** `collect_draw_data` borrows `&Diagram` from `state.project.diagrams`. After it returns owned `DiagramDrawData`, the borrow is structurally live until the end of the `let Some(diagram)` binding. Cloning the diagram makes it an owned value, fully releasing the project borrow before `apply_badges` needs `&AppState` for `state.validation`. The clone cost is proportional to the number of nodes/streams and occurs once per frame — acceptable for the drawing phase.
+
+**`apply_badges` is a separate pass** rather than being integrated into `collect_draw_data`. This keeps the data collection function free of `ValidationCache` imports and makes the badge logic independently testable.
+
+**`DiagramDrawData` is fully owned.** All draw data (rects, polyline points, badge states) is moved into `DiagramDrawData` before the `Painter` is obtained. This avoids lifetime tangles between the painter's borrow of the `Ui` and any borrows of `AppState`.
+
+**Stream routing exits right, enters left by default.** When source is left of target the stream exits the source's right-edge midpoint and enters the target's left-edge midpoint with a single 90° bend at the horizontal midpoint. When source is right of target (backward-pointing), the stream exits the source's bottom-edge midpoint and enters the target's top, avoiding a degenerate backward arrow.
+
+**Group offsets use a centred slot formula.** For a group of N streams, offset = `(slot - (N-1)/2) × GROUP_OFFSET`, keeping grouped streams visually balanced around the base path.
+
+**Dashed border for boundary nodes** walks the rectangle perimeter with `draw_dashed_segment`. `egui::Painter` has no native dashed-stroke primitive in 0.29.
+
+**`egui::StrokeKind` not used.** The 4-argument `Painter::rect_stroke` with `StrokeKind` was added after 0.29. The 3-argument form is used instead.
+
+**Grid dots** are drawn at 40-canvas-unit intervals, suppressed when `grid_spacing < 8.0` screen pixels.
+
 ---
 
 ## 6. Diagram Decomposition

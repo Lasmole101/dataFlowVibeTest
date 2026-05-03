@@ -318,39 +318,9 @@ fn render_right_panel(state: &mut AppState, ui: &mut Ui) {
     }
 }
 
-/// Renders the central canvas area.
-///
-/// Phase 6a: placeholder with diagram info.  Canvas drawing implemented in
-/// Phase 8 (`ui::canvas::show`).
+/// Renders the central canvas area — delegates to [`crate::ui::canvas::show`].
 fn render_canvas_placeholder(state: &mut AppState, ui: &mut Ui) {
-    let diagram = state.project.diagram(state.active_diagram_id);
-
-    ui.vertical_centered(|ui| {
-        ui.add_space(40.0);
-
-        ui.heading(
-            state
-                .project
-                .diagram(state.active_diagram_id)
-                .map(|d| d.name.as_str())
-                .unwrap_or("(no diagram)"),
-        );
-
-        ui.add_space(12.0);
-
-        if let Some(diag) = diagram {
-            let node_count = diag.nodes.len();
-            let stream_count = diag.streams.len();
-            ui.label(format!("{node_count} node(s)   {stream_count} stream(s)"));
-        }
-
-        ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("Canvas rendering implemented in Phase 8.").color(egui::Color32::GRAY),
-        );
-    });
+    crate::ui::canvas::show(state, ui);
 }
 
 /// "Set Sub-diagram" dialog — delegates to [`crate::ui::dialogs::SetSubDiagramDialog::show`].
