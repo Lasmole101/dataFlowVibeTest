@@ -355,6 +355,22 @@ A single global undo/redo stack covers all changes across all diagram levels. A 
 
 **Streams are never read-only.** Stream type specs are always editable regardless of the nodes at either end. The stream panel displays a short UUID prefix instead of a name field since streams have no user-visible name.
 
+#### Implementation decisions (phase 7c — dialogs)
+
+**`DialogResult<T>` tri-state enum** replaces `Option<T>` as the return type of all `show()` methods. `Pending` = still open, `Confirmed(T)` = accepted this frame, `Cancelled` = dismissed this frame. This gives callers a clean match without tracking "was it open last frame" separately, and avoids `Option<Option<T>>` ugliness.
+
+**`show()` closes the dialog internally** by setting `self.open = false` on both `Confirmed` and `Cancelled`. Callers only respond to the result — they never need to write `state.dialogs.foo.open = false` themselves.
+
+**`first_frame: bool`** on `RenameDialog` and `CreateGroupDialog` auto-focuses the text field exactly once (the first frame after `open_for` is called). Calling `request_focus()` every frame would steal focus from other widgets. The field is private to prevent accidental external mutation.
+
+**`open_for` / `open_with` convenience constructors** replace the three-line open pattern (`open = true; field = value; other_field = value`). All call sites in `tree_pane.rs` were updated to use these. This makes dialog opening less error-prone and keeps the state consistent.
+
+**Inline dialog implementations in `tree_pane.rs` and `app.rs` are fully replaced.** `render_rename_dialog` in `tree_pane.rs` and `render_set_subdiagram_dialog` in `app.rs` now consist of a single `match dialog.show(ctx)` with only the action logic in the `Confirmed` arm. The ~50 lines of duplicated window-building code are eliminated.
+
+**`SetSubDiagramDialog` uses a scrollable list with `selectable_label`** — the user first selects a diagram (which highlights it) and then clicks "Attach". This two-step interaction prevents accidental attachment and matches the UX of file-picker lists. An empty orphan list shows a grey informational label rather than disabling the dialog.
+
+**`ConfirmDeleteDialog` places the destructive "Delete" button on the left** in red, with "Cancel" to its right. This is the opposite of most confirmation dialogs but matches the destructive-action pattern where the primary action is visually prominent. The ⚠ icon is shown in amber. Escape always cancels.
+
 ---
 
 ## 6. Diagram Decomposition

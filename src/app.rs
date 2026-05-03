@@ -353,67 +353,27 @@ fn render_canvas_placeholder(state: &mut AppState, ui: &mut Ui) {
     });
 }
 
-/// Inline "Set Sub-diagram" picker dialog.
-///
-/// Opened by the tree pane's process node context menu.  Replaces the
-/// `todo!()` in `dialogs::SetSubDiagramDialog::show` until Phase 7.
+/// "Set Sub-diagram" dialog — delegates to [`crate::ui::dialogs::SetSubDiagramDialog::show`].
 fn render_set_subdiagram_dialog(state: &mut AppState, ctx: &Context) {
-    if !state.dialogs.set_subdiagram.open {
-        return;
-    }
+    // Snapshot process_id before the mutable borrow of dialogs.
+    let process_id = state.dialogs.set_subdiagram.target_process_id;
 
-    let Some(process_id) = state.dialogs.set_subdiagram.target_process_id else {
-        state.dialogs.set_subdiagram.open = false;
-        return;
-    };
-
-    let mut chosen: Option<Uuid> = None;
-    let mut cancel = false;
-
-    // Clone orphan list to avoid borrow issues inside the window closure.
-    let orphans = state.dialogs.set_subdiagram.orphans.clone();
-
-    egui::Window::new("Set Sub-diagram")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label("Select an orphaned diagram to attach:");
-            ui.separator();
-
-            if orphans.is_empty() {
-                ui.label(
-                    RichText::new("No orphaned diagrams available.").color(egui::Color32::GRAY),
-                );
-            } else {
-                for (id, name) in &orphans {
-                    if ui.selectable_label(false, format!("📄 {name}")).clicked() {
-                        chosen = Some(*id);
-                    }
+    match state.dialogs.set_subdiagram.show(ctx) {
+        crate::ui::dialogs::DialogResult::Confirmed(orphan_id) => {
+            if let Some(pid) = process_id {
+                let cmd = crate::undo::commands::AttachOrphan {
+                    orphan_diagram_id: orphan_id,
+                    process_node_id: pid,
+                };
+                if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+                    state.set_status(format!("Attach orphan failed: {e}"));
+                } else {
+                    state.dirty = true;
+                    state.validation.validate_full(&state.project);
                 }
             }
-
-            ui.separator();
-            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                cancel = true;
-            }
-        });
-
-    if let Some(orphan_id) = chosen {
-        let cmd = crate::undo::commands::AttachOrphan {
-            orphan_diagram_id: orphan_id,
-            process_node_id: process_id,
-        };
-        if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
-            state.set_status(format!("Attach orphan failed: {e}"));
-        } else {
-            state.dirty = true;
-            state.validation.validate_full(&state.project);
         }
-        state.dialogs.set_subdiagram.open = false;
-        state.dialogs.set_subdiagram.target_process_id = None;
-    } else if cancel {
-        state.dialogs.set_subdiagram.open = false;
-        state.dialogs.set_subdiagram.target_process_id = None;
+        crate::ui::dialogs::DialogResult::Cancelled | crate::ui::dialogs::DialogResult::Pending => {
+        }
     }
 }

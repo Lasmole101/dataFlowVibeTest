@@ -322,9 +322,7 @@ fn render_orphan_row(state: &mut AppState, ui: &mut Ui, entry: &OrphanEntry) {
 /// Context menu for a diagram row.
 fn diagram_context_menu(state: &mut AppState, ui: &mut Ui, diagram_id: Uuid, current_name: &str) {
     if ui.button("Rename…").clicked() {
-        state.dialogs.rename.open = true;
-        state.dialogs.rename.target_id = Some(diagram_id);
-        state.dialogs.rename.buffer = current_name.to_owned();
+        state.dialogs.rename.open_for(diagram_id, current_name);
         ui.close_menu();
     }
 }
@@ -356,16 +354,13 @@ fn process_context_menu(
 
     // "Set Sub-diagram…" — only when orphaned diagrams exist and node has no sub-diagram.
     if !has_sub_diagram && has_orphans && ui.button("Set Sub-diagram…").clicked() {
-        // Collect orphan list first to avoid simultaneous borrows of state.
         let orphan_list: Vec<(Uuid, String)> = state
             .project
             .orphaned_diagram_ids
             .iter()
             .filter_map(|&id| state.project.diagram(id).map(|d| (id, d.name.clone())))
             .collect();
-        state.dialogs.set_subdiagram.open = true;
-        state.dialogs.set_subdiagram.target_process_id = Some(node_id);
-        state.dialogs.set_subdiagram.orphans = orphan_list;
+        state.dialogs.set_subdiagram.open_for(node_id, orphan_list);
         ui.close_menu();
     }
 
@@ -384,59 +379,19 @@ fn process_context_menu(
 // ---------------------------------------------------------------------------
 
 /// Render the inline rename dialog.
-///
-/// Uses `AppState::dialogs.rename` directly rather than the `todo!()` stub
-/// in `dialogs::RenameDialog::show`.  When Phase 7 implements that stub this
-/// function will be replaced by a single call to `state.dialogs.rename.show()`.
+/// Delegates to [`crate::ui::dialogs::RenameDialog::show`].
 fn render_rename_dialog(state: &mut AppState, ui: &mut Ui) {
-    if !state.dialogs.rename.open {
-        return;
-    }
+    // Snapshot target_id before the mutable borrow of dialogs.
+    let target_id = state.dialogs.rename.target_id;
 
-    let Some(target_id) = state.dialogs.rename.target_id else {
-        state.dialogs.rename.open = false;
-        return;
-    };
-
-    let mut confirmed_name: Option<String> = None;
-    let mut cancel = false;
-
-    egui::Window::new("Rename")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ui.ctx(), |ui| {
-            ui.label("New name:");
-            let resp = ui.text_edit_singleline(&mut state.dialogs.rename.buffer);
-
-            // Focus the text field on open.
-            resp.request_focus();
-
-            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-
-            ui.horizontal(|ui| {
-                let can_confirm = !state.dialogs.rename.buffer.trim().is_empty();
-                if ui
-                    .add_enabled(can_confirm, egui::Button::new("OK"))
-                    .clicked()
-                    || (enter_pressed && can_confirm)
-                {
-                    confirmed_name = Some(state.dialogs.rename.buffer.trim().to_owned());
-                }
-                if ui.button("Cancel").clicked() || esc_pressed {
-                    cancel = true;
-                }
-            });
-        });
-
-    if let Some(new_name) = confirmed_name {
-        apply_rename(state, target_id, new_name);
-        state.dialogs.rename.open = false;
-        state.dialogs.rename.target_id = None;
-    } else if cancel {
-        state.dialogs.rename.open = false;
-        state.dialogs.rename.target_id = None;
+    match state.dialogs.rename.show(ui.ctx()) {
+        crate::ui::dialogs::DialogResult::Confirmed(new_name) => {
+            if let Some(id) = target_id {
+                apply_rename(state, id, new_name);
+            }
+        }
+        crate::ui::dialogs::DialogResult::Cancelled | crate::ui::dialogs::DialogResult::Pending => {
+        }
     }
 }
 
