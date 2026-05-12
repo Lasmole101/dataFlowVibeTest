@@ -1,7 +1,7 @@
-//! Canvas drawing and interaction layer (spec §5.1, phases 8a–8b).
+//! Canvas drawing and interaction layer (spec §5.1, phases 8a–8c).
 //!
 //! Renders the active diagram's nodes, streams, and validation badges using
-//! the egui [`Painter`] API.  Phase 8b adds zoom, pan, and selection.
+//! the egui [`Painter`] API.
 //!
 //! # Coordinate systems
 //!
@@ -12,53 +12,21 @@
 //!   (the `Painter`'s clip rect origin).
 //!
 //! Transform: `screen = (canvas - scroll) * zoom + panel_origin`
-//! Inverse:   `canvas = screen / zoom - panel_origin / zoom + scroll`
-//!            (i.e. `cx = (screen.x - origin.x) / zoom + scroll.x`)
+//! Inverse:   `canvas = (screen - panel_origin) / zoom + scroll`
 //!
-//! # Node layout
+//! # Node drag (phase 8c)
 //!
-//! Each node is a fixed 120×60 canvas-unit rounded rectangle.  The position
-//! stored in `diagram.positions` is the **top-left corner** in canvas space.
+//! Pressing the primary button over a node (without Space held) starts a drag.
+//! The node position is overridden live in [`collect_draw_data`] so the node
+//! follows the cursor.  On release a [`MoveNode`] command is dispatched with
+//! the before/after positions.  Positions snap to a 16-canvas-unit grid on drop.
 //!
-//! # Stream routing
+//! # Node palette (phase 8c)
 //!
-//! Streams are drawn as two-segment orthogonal (L-shaped) paths:
-//! * Segment 1: horizontal from the source node's right-edge midpoint to the
-//!   horizontal midpoint between source and target.
-//! * Segment 2: vertical from that midpoint down/up to the target's left-edge
-//!   midpoint y, then horizontal to the target.
-//!
-//! When the source centre is to the right of the target centre the routing
-//! exits from the source bottom and enters the target top instead, to avoid
-//! a degenerate backward arrow.
-//!
-//! # Stream groups
-//!
-//! Grouped streams are drawn with a small perpendicular offset so they appear
-//! as parallel lines rather than overlapping.  The group membership index
-//! determines the offset direction.
-//!
-//! # Validation badges
-//!
-//! A small filled circle is drawn at the top-right corner of each node and
-//! at the midpoint of each stream:
-//! * Amber  — `ValidationState::Warning`
-//! * Red    — `ValidationState::Error`
-//! * Nothing — `ValidationState::Ok`
-//!
-//! # Selection (phase 8b)
-//!
-//! Clicking a node or stream selects it (stores the UUID in
-//! [`AppState::selected_id`]).  The selected component is drawn with a
-//! cyan highlight outline.  Clicking empty canvas deselects.
-//! Double-clicking or pressing Enter opens the spec panel for the selection.
-//!
-//! # Zoom and pan (phase 8b)
-//!
-//! * **Zoom**: scroll wheel scales around the mouse cursor.  Stored in
-//!   [`ViewportState::zoom`] and applied immediately on the next frame.
-//! * **Pan**: middle-mouse drag or Space+left-drag moves the viewport.
-//!   Stored in [`ViewportState::scroll`].
+//! A small floating panel in the top-left corner lists Source / Sink / Process
+//! buttons.  Pressing and dragging a button begins a palette drag tracked in
+//! [`AppState::drag_state`].  Releasing over the canvas dispatches [`AddNode`]
+//! at the snapped drop position, centred on the cursor.
 
 use std::collections::HashMap;
 
@@ -67,7 +35,11 @@ use uuid::Uuid;
 
 use crate::{
     app::{ActivePanel, AppState},
-    model::{diagram::Diagram, node::NodeKind},
+    model::{
+        diagram::Diagram,
+        node::{Node, NodeKind},
+    },
+    undo::commands::{AddNode, MoveNode},
     validation::validator::ValidationState,
 };
 
@@ -112,6 +84,8 @@ const ZOOM_FACTOR_PER_NOTCH: f32 = 1.15;
 /// Hard zoom bounds.
 const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 20.0;
+/// Grid snap size in canvas units (applied on node drop).
+const SNAP_GRID: f32 = 16.0;
 
 // ---------------------------------------------------------------------------
 // Node colours
@@ -161,16 +135,16 @@ fn stream_color(dark_mode: bool) -> Color32 {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Render the active diagram into the central panel, handling zoom/pan/selection.
+/// Render the active diagram into the central panel and handle all interactions.
 pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     let panel_rect = ui.available_rect_before_wrap();
 
     // Allocate the full panel as an interactive widget (primary-button click +
-    // drag).  Middle-mouse events are read from the global InputState directly.
+    // drag).  Middle-mouse events are read from global InputState directly.
     let response = ui.allocate_rect(panel_rect, egui::Sense::click_and_drag());
 
-    // Clone the active diagram so we can release the project borrow before the
-    // interaction code needs `&mut state`.
+    // Clone the active diagram to release the project borrow before any code
+    // that needs `&mut state`.
     let diagram = match state.project.diagrams.get(&state.active_diagram_id) {
         Some(d) => d.clone(),
         None => {
@@ -193,8 +167,6 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
         if scroll_y != 0.0 {
             let factor = ZOOM_FACTOR_PER_NOTCH.powf(scroll_y / ZOOM_NOTCH);
             let new_zoom = (zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-
-            // Keep the canvas point currently under the cursor fixed.
             if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
                 let cx = (mouse.x - panel_rect.min.x) / zoom + scroll.x;
                 let cy = (mouse.y - panel_rect.min.y) / zoom + scroll.y;
@@ -211,15 +183,12 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     {
         let middle_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
         let middle_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
-
-        // Latch: pan only if the drag started while the pointer was in the canvas.
         if middle_pressed && response.hovered() {
             state.drag_state.mid_drag_active = true;
         }
         if !middle_down {
             state.drag_state.mid_drag_active = false;
         }
-
         if state.drag_state.mid_drag_active {
             let delta = ui.input(|i| i.pointer.delta());
             if delta != Vec2::ZERO {
@@ -233,22 +202,20 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     // -----------------------------------------------------------------------
     // Pan — Space + primary drag
     // -----------------------------------------------------------------------
-    {
-        let space_down = ui.input(|i| i.key_down(egui::Key::Space));
-        if space_down {
-            if response.dragged() {
-                let delta = response.drag_delta();
-                scroll.x -= delta.x / zoom;
-                scroll.y -= delta.y / zoom;
-                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-            } else if response.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::Grab);
-            }
+    let space_down = ui.input(|i| i.key_down(egui::Key::Space));
+    if space_down {
+        if response.dragged() {
+            let delta = response.drag_delta();
+            scroll.x -= delta.x / zoom;
+            scroll.y -= delta.y / zoom;
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }
     }
 
     // -----------------------------------------------------------------------
-    // Build transform with (potentially updated) zoom / scroll
+    // Build transform
     // -----------------------------------------------------------------------
     let xform = Transform {
         zoom,
@@ -257,47 +224,162 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     };
 
     // -----------------------------------------------------------------------
-    // Collect draw data — positions are now in screen space
+    // Node drag — START
+    // Detected before collect_draw_data so the override is active from the
+    // first frame of movement (the very first frame uses the original pos).
     // -----------------------------------------------------------------------
-    let mut draw_data = collect_draw_data(&diagram, &xform, state.selected_id);
-    apply_badges(&mut draw_data, state);
-
-    // -----------------------------------------------------------------------
-    // Hit-test and selection (single click)
-    // -----------------------------------------------------------------------
-    // Read interact_pos inside the closures to avoid multiple borrows of `ui`.
-    let interact_pos = ui.input(|i| i.pointer.interact_pos());
-
-    if response.double_clicked() {
-        // Double-click: select the hit component and open its spec panel.
-        let hit = interact_pos.and_then(|p| hit_test(&draw_data, p));
-        state.selected_id = hit;
-        if let Some(id) = hit {
-            state.active_panel = ActivePanel::Spec(id);
-            mark_selected(&mut draw_data, id);
-        }
-    } else if response.clicked() {
-        // Single click: update selection; deselect on empty canvas.
-        let hit = interact_pos.and_then(|p| hit_test(&draw_data, p));
-        state.selected_id = hit;
-        if let Some(id) = hit {
-            mark_selected(&mut draw_data, id);
-        }
-    } else {
-        // No click this frame — just keep the existing selection highlighted.
-        if let Some(id) = state.selected_id {
-            mark_selected(&mut draw_data, id);
+    let is_panning = space_down || state.drag_state.mid_drag_active;
+    if response.drag_started()
+        && !is_panning
+        && state.drag_state.dragging_node.is_none()
+        && state.drag_state.palette_drag.is_none()
+    {
+        let ptr = ui.input(|i| i.pointer.interact_pos());
+        if let Some(ptr) = ptr {
+            if let Some((node_id, orig_pos)) = quick_hit_test_nodes(&diagram, &xform, ptr) {
+                let canvas_ptr = xform.to_canvas(ptr);
+                let offset = Vec2::new(canvas_ptr.0 - orig_pos.0, canvas_ptr.1 - orig_pos.1);
+                state.drag_state.dragging_node = Some((node_id, orig_pos, offset));
+                state.selected_id = Some(node_id);
+            }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Enter key: open spec panel for the currently selected component
+    // Compute live drag-position override for collect_draw_data
+    // -----------------------------------------------------------------------
+    let drag_pos_override: Option<(Uuid, (f32, f32))> =
+        if let Some((node_id, _orig, offset)) = state.drag_state.dragging_node {
+            ui.input(|i| i.pointer.hover_pos()).map(|ptr| {
+                let cp = xform.to_canvas(ptr);
+                (node_id, (cp.0 - offset.x, cp.1 - offset.y))
+            })
+        } else {
+            None
+        };
+
+    // -----------------------------------------------------------------------
+    // Collect draw data
+    // -----------------------------------------------------------------------
+    let mut draw_data = collect_draw_data(&diagram, &xform, drag_pos_override);
+    apply_badges(&mut draw_data, state);
+
+    // -----------------------------------------------------------------------
+    // Node drag — END
+    // -----------------------------------------------------------------------
+    if response.drag_stopped() {
+        if let Some((node_id, from_pos, offset)) = state.drag_state.dragging_node.take() {
+            let to_pos = ui
+                .input(|i| i.pointer.hover_pos())
+                .map(|ptr| {
+                    let cp = xform.to_canvas(ptr);
+                    snap_to_grid((cp.0 - offset.x, cp.1 - offset.y))
+                })
+                .unwrap_or(from_pos);
+
+            if to_pos != from_pos {
+                let cmd = MoveNode {
+                    diagram_id: state.active_diagram_id,
+                    node_id,
+                    from: from_pos,
+                    to: to_pos,
+                };
+                if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+                    state.set_status(format!("Move node failed: {e}"));
+                } else {
+                    state.dirty = true;
+                    state.validation.validate_incremental(node_id, &state.project);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Palette drag — DROP (primary button released anywhere)
+    // -----------------------------------------------------------------------
+    let primary_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+    if primary_released {
+        // palette_drag is Copy (NodeKind is Copy), so we can read and then clear.
+        if let Some(kind) = state.drag_state.palette_drag {
+            state.drag_state.palette_drag = None;
+            if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
+                if panel_rect.contains(ptr) {
+                    let cp = xform.to_canvas(ptr);
+                    // Centre the new node on the drop position then snap.
+                    let node_pos =
+                        snap_to_grid((cp.0 - NODE_W / 2.0, cp.1 - NODE_H / 2.0));
+                    let name = next_node_name(&diagram, kind);
+                    let node = Node::new(kind, name);
+                    let node_id = node.id;
+                    let diagram_id = state.active_diagram_id;
+                    let cmd = AddNode { diagram_id, node, position: node_pos };
+                    if let Err(e) =
+                        state.undo_stack.execute(Box::new(cmd), &mut state.project)
+                    {
+                        state.set_status(format!("Add node failed: {e}"));
+                    } else {
+                        state.dirty = true;
+                        state.selected_id = Some(node_id);
+                        state.validation.validate_incremental(node_id, &state.project);
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Escape — cancel active drags without committing
+    // -----------------------------------------------------------------------
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.drag_state.dragging_node = None;
+        state.drag_state.palette_drag = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Click — selection (suppressed while a node/palette drag is in progress)
+    // -----------------------------------------------------------------------
+    let dragging_anything =
+        state.drag_state.dragging_node.is_some() || state.drag_state.palette_drag.is_some();
+
+    if !dragging_anything {
+        let interact_pos = ui.input(|i| i.pointer.interact_pos());
+        if response.double_clicked() {
+            let hit = interact_pos.and_then(|p| hit_test(&draw_data, p));
+            state.selected_id = hit;
+            if let Some(id) = hit {
+                state.active_panel = ActivePanel::Spec(id);
+            }
+        } else if response.clicked() {
+            state.selected_id = interact_pos.and_then(|p| hit_test(&draw_data, p));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Enter key — open spec panel for selected component
     // -----------------------------------------------------------------------
     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         if let Some(id) = state.selected_id {
             state.active_panel = ActivePanel::Spec(id);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Cursor icon — grab cursor when hovering over a draggable node
+    // -----------------------------------------------------------------------
+    if !is_panning {
+        if state.drag_state.dragging_node.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
+            if quick_hit_test_nodes(&diagram, &xform, ptr).is_some() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sync selection into draw data (after all interactions that may change it)
+    // -----------------------------------------------------------------------
+    mark_selected(&mut draw_data, state.selected_id);
 
     // -----------------------------------------------------------------------
     // Write back viewport if it changed this frame
@@ -318,7 +400,6 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     // -----------------------------------------------------------------------
     let painter = ui.painter_at(panel_rect);
 
-    // Background fill.
     painter.rect_filled(
         panel_rect,
         0.0,
@@ -329,15 +410,11 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
         },
     );
 
-    // Grid dots.
     draw_grid(&painter, panel_rect, &xform, dark_mode);
 
-    // Streams beneath nodes.
     for sd in &draw_data.streams {
         draw_stream(&painter, sd, dark_mode, &draw_data.group_offsets);
     }
-
-    // Nodes.
     for nd in &draw_data.nodes {
         draw_node(&painter, nd, dark_mode);
     }
@@ -354,7 +431,7 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
         }
     }
 
-    // Validation badges on top.
+    // Validation badges.
     for nd in &draw_data.nodes {
         if nd.badge != ValidationState::Ok {
             draw_node_badge(&painter, nd);
@@ -365,6 +442,20 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
             draw_stream_badge(&painter, sd);
         }
     }
+
+    // Ghost node while dragging from palette.
+    if let Some(kind) = state.drag_state.palette_drag {
+        if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
+            if panel_rect.contains(ptr) {
+                draw_palette_ghost(&painter, &xform, kind, ptr, dark_mode);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Node palette window
+    // -----------------------------------------------------------------------
+    show_node_palette(state, ui.ctx());
 }
 
 // ---------------------------------------------------------------------------
@@ -378,21 +469,18 @@ struct Transform {
 }
 
 impl Transform {
-    /// Convert a canvas-space position to screen-space.
     fn to_screen(&self, canvas: (f32, f32)) -> Pos2 {
         let cx = (canvas.0 - self.scroll.x) * self.zoom;
         let cy = (canvas.1 - self.scroll.y) * self.zoom;
         self.origin + Vec2::new(cx, cy)
     }
 
-    /// Convert a screen-space position to canvas-space.
     fn to_canvas(&self, screen: Pos2) -> (f32, f32) {
         let sx = screen.x - self.origin.x;
         let sy = screen.y - self.origin.y;
         (sx / self.zoom + self.scroll.x, sy / self.zoom + self.scroll.y)
     }
 
-    /// Scale a canvas-space length to screen-space.
     fn scale(&self, v: f32) -> f32 {
         v * self.zoom
     }
@@ -404,7 +492,7 @@ impl Transform {
 
 struct NodeDrawData {
     node_id: Uuid,
-    rect: Rect, // screen-space rect
+    rect: Rect,
     kind: NodeKind,
     name: String,
     is_boundary: bool,
@@ -414,20 +502,16 @@ struct NodeDrawData {
 
 struct StreamDrawData {
     stream_id: Uuid,
-    /// Polyline points in screen space (3 or 4 points for an L-shape).
     points: Vec<Pos2>,
-    /// Midpoint of the path — badge placement.
     midpoint: Pos2,
     badge: ValidationState,
-    /// Which group this stream belongs to (None if ungrouped).
     group_id: Option<Uuid>,
     selected: bool,
 }
 
-struct DiagramDrawData {
+pub(crate) struct DiagramDrawData {
     nodes: Vec<NodeDrawData>,
     streams: Vec<StreamDrawData>,
-    /// group_id → Vec of stream_ids in order (for offset computation).
     group_offsets: HashMap<Uuid, Vec<Uuid>>,
 }
 
@@ -438,27 +522,29 @@ struct DiagramDrawData {
 fn collect_draw_data(
     diagram: &Diagram,
     xform: &Transform,
-    selected_id: Option<Uuid>,
+    drag_pos_override: Option<(Uuid, (f32, f32))>,
 ) -> DiagramDrawData {
-    // Build group membership map: group_id → ordered stream ids.
     let mut group_offsets: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for (gid, group) in &diagram.stream_groups {
         group_offsets.insert(*gid, group.member_stream_ids.clone());
     }
 
-    // Build a lookup of node screen rects for stream endpoint computation.
+    // Build node screen rects, applying the live drag override.
     let node_rects: HashMap<Uuid, Rect> = diagram
         .nodes
         .keys()
         .filter_map(|&nid| {
-            let pos = diagram.positions.get(&nid).copied().unwrap_or((0.0, 0.0));
+            let pos = if drag_pos_override.map_or(false, |(id, _)| id == nid) {
+                drag_pos_override.unwrap().1
+            } else {
+                diagram.positions.get(&nid).copied().unwrap_or((0.0, 0.0))
+            };
             let tl = xform.to_screen(pos);
             let br = tl + Vec2::new(xform.scale(NODE_W), xform.scale(NODE_H));
             Some((nid, Rect::from_min_max(tl, br)))
         })
         .collect();
 
-    // Collect node draw data.
     let mut nodes: Vec<NodeDrawData> = diagram
         .nodes
         .values()
@@ -474,13 +560,12 @@ fn collect_draw_data(
                 name: node.name.clone(),
                 is_boundary: node.is_boundary,
                 badge: ValidationState::Ok,
-                selected: selected_id == Some(node.id),
+                selected: false,
             }
         })
         .collect();
     nodes.sort_by_key(|n| n.node_id);
 
-    // Collect stream draw data.
     let mut streams: Vec<StreamDrawData> = diagram
         .streams
         .values()
@@ -494,21 +579,17 @@ fn collect_draw_data(
                 midpoint,
                 badge: ValidationState::Ok,
                 group_id: stream.group_id,
-                selected: selected_id == Some(stream.id),
+                selected: false,
             }
         })
         .collect();
     streams.sort_by_key(|s| s.stream_id);
 
-    DiagramDrawData {
-        nodes,
-        streams,
-        group_offsets,
-    }
+    DiagramDrawData { nodes, streams, group_offsets }
 }
 
-/// Attach validation badge states — done as a separate pass to keep
-/// `collect_draw_data` free of validation imports.
+/// Attach validation badge states — separate pass to keep collect_draw_data
+/// free of validation imports.
 pub fn apply_badges(data: &mut DiagramDrawData, state: &AppState) {
     for nd in &mut data.nodes {
         nd.badge = state.validation.state(nd.node_id);
@@ -518,8 +599,12 @@ pub fn apply_badges(data: &mut DiagramDrawData, state: &AppState) {
     }
 }
 
-/// Mark the draw-data entry with the given UUID as selected.
-fn mark_selected(data: &mut DiagramDrawData, id: Uuid) {
+/// Set the `selected` flag on the draw-data entry matching `selected_id`.
+fn mark_selected(data: &mut DiagramDrawData, selected_id: Option<Uuid>) {
+    let id = match selected_id {
+        Some(id) => id,
+        None => return,
+    };
     for nd in &mut data.nodes {
         nd.selected = nd.node_id == id;
     }
@@ -532,11 +617,11 @@ fn mark_selected(data: &mut DiagramDrawData, id: Uuid) {
 // Hit testing
 // ---------------------------------------------------------------------------
 
-/// Return the UUID of the topmost node or stream under `pos` (screen space),
-/// or `None` if nothing was hit.  Nodes are tested before streams (drawn on
-/// top).
+/// Return the UUID of the topmost node or stream under screen-space `pos`,
+/// or `None`.  Nodes take priority over streams.
 fn hit_test(draw_data: &DiagramDrawData, pos: Pos2) -> Option<Uuid> {
-    for nd in &draw_data.nodes {
+    // Nodes are drawn sorted by UUID ascending; test in reverse (visually topmost first).
+    for nd in draw_data.nodes.iter().rev() {
         if nd.rect.contains(pos) {
             return Some(nd.node_id);
         }
@@ -549,8 +634,23 @@ fn hit_test(draw_data: &DiagramDrawData, pos: Pos2) -> Option<Uuid> {
     None
 }
 
-/// Return `true` if `pos` is within `tolerance` screen pixels of any segment
-/// in the polyline.
+/// Quickly find a node under screen-space `ptr` using diagram data directly
+/// (without a full DrawData pass).  Returns `(node_id, canvas_tl)` or `None`.
+fn quick_hit_test_nodes(diagram: &Diagram, xform: &Transform, ptr: Pos2) -> Option<(Uuid, (f32, f32))> {
+    // Test in reverse sort order so visually-topmost node wins.
+    let mut ids: Vec<Uuid> = diagram.nodes.keys().copied().collect();
+    ids.sort_by(|a, b| b.cmp(a));
+    for nid in ids {
+        let pos = diagram.positions.get(&nid).copied().unwrap_or((0.0, 0.0));
+        let tl = xform.to_screen(pos);
+        let br = tl + Vec2::new(xform.scale(NODE_W), xform.scale(NODE_H));
+        if Rect::from_min_max(tl, br).contains(ptr) {
+            return Some((nid, pos));
+        }
+    }
+    None
+}
+
 fn hit_test_polyline(pos: Pos2, points: &[Pos2], tolerance: f32) -> bool {
     for w in points.windows(2) {
         if dist_point_to_segment(pos, w[0], w[1]) <= tolerance {
@@ -560,7 +660,6 @@ fn hit_test_polyline(pos: Pos2, points: &[Pos2], tolerance: f32) -> bool {
     false
 }
 
-/// Shortest distance from point `p` to the line segment `[a, b]`.
 fn dist_point_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
     let ap = p - a;
@@ -568,22 +667,36 @@ fn dist_point_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     if len_sq < f32::EPSILON {
         return ap.length();
     }
-    let t = ap.dot(ab) / len_sq;
-    let closest = a + ab * t.clamp(0.0, 1.0);
+    let closest = a + ab * (ap.dot(ab) / len_sq).clamp(0.0, 1.0);
     (p - closest).length()
+}
+
+// ---------------------------------------------------------------------------
+// Grid snap
+// ---------------------------------------------------------------------------
+
+/// Snap a canvas-space position to the nearest 16-unit grid point.
+fn snap_to_grid(pos: (f32, f32)) -> (f32, f32) {
+    (
+        (pos.0 / SNAP_GRID).round() * SNAP_GRID,
+        (pos.1 / SNAP_GRID).round() * SNAP_GRID,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Node naming helper
+// ---------------------------------------------------------------------------
+
+/// Generate a default name for a new node of `kind` based on existing counts.
+fn next_node_name(diagram: &Diagram, kind: NodeKind) -> String {
+    let count = diagram.nodes.values().filter(|n| n.kind == kind).count();
+    format!("{} {}", kind.label(), count + 1)
 }
 
 // ---------------------------------------------------------------------------
 // Stream path computation
 // ---------------------------------------------------------------------------
 
-/// Compute the screen-space polyline for a stream.
-///
-/// Returns (points, midpoint).  `points` has 4 entries for a full L-shape:
-/// `[src_exit, h_bend, v_bend, tgt_enter]`.
-///
-/// If either endpoint rect is missing (dangling stream) a degenerate
-/// horizontal line is returned at the panel origin.
 fn compute_stream_path(src_rect: Option<Rect>, tgt_rect: Option<Rect>) -> (Vec<Pos2>, Pos2) {
     let (src_r, tgt_r) = match (src_rect, tgt_rect) {
         (Some(s), Some(t)) => (s, t),
@@ -593,10 +706,7 @@ fn compute_stream_path(src_rect: Option<Rect>, tgt_rect: Option<Rect>) -> (Vec<P
         }
     };
 
-    let src_cx = src_r.center().x;
-    let tgt_cx = tgt_r.center().x;
-
-    let (src_exit, tgt_entry) = if src_cx <= tgt_cx {
+    let (src_exit, tgt_entry) = if src_r.center().x <= tgt_r.center().x {
         (
             Pos2::new(src_r.max.x, src_r.center().y),
             Pos2::new(tgt_r.min.x, tgt_r.center().y),
@@ -611,11 +721,8 @@ fn compute_stream_path(src_rect: Option<Rect>, tgt_rect: Option<Rect>) -> (Vec<P
     let mid_x = (src_exit.x + tgt_entry.x) * 0.5;
     let h_bend = Pos2::new(mid_x, src_exit.y);
     let v_bend = Pos2::new(mid_x, tgt_entry.y);
-
-    let points = vec![src_exit, h_bend, v_bend, tgt_entry];
     let midpoint = h_bend.lerp(v_bend, 0.5);
-
-    (points, midpoint)
+    (vec![src_exit, h_bend, v_bend, tgt_entry], midpoint)
 }
 
 // ---------------------------------------------------------------------------
@@ -634,11 +741,9 @@ fn draw_grid(painter: &Painter, rect: Rect, xform: &Transform, dark_mode: bool) 
         return;
     }
 
-    // Align first dot to the grid in canvas space, then convert to screen.
     let (canvas_min_x, canvas_min_y) = xform.to_canvas(rect.min);
     let start_cx = (canvas_min_x / 40.0).floor() * 40.0;
     let start_cy = (canvas_min_y / 40.0).floor() * 40.0;
-
     let start = xform.to_screen((start_cx, start_cy));
 
     let mut x = start.x;
@@ -661,45 +766,63 @@ fn draw_node(painter: &Painter, nd: &NodeDrawData, dark_mode: bool) {
     let stroke_color = node_stroke_color(nd.kind, dark_mode);
     let rounding = Rounding::same(NODE_ROUNDING);
 
+    painter.rect_filled(nd.rect, rounding, fill);
     if nd.is_boundary {
-        painter.rect_filled(nd.rect, rounding, fill);
-        draw_dashed_rect(
-            painter,
-            nd.rect,
-            rounding,
-            Stroke::new(NODE_STROKE, stroke_color),
-        );
+        draw_dashed_rect(painter, nd.rect, rounding, Stroke::new(NODE_STROKE, stroke_color));
     } else {
-        painter.rect_filled(nd.rect, rounding, fill);
         painter.rect_stroke(nd.rect, rounding, Stroke::new(NODE_STROKE, stroke_color));
     }
 
     let label = format!("{}\n{}", nd.name, nd.kind.label());
-    let text_color = if dark_mode {
-        Color32::WHITE
-    } else {
-        Color32::BLACK
-    };
     painter.text(
         nd.rect.center(),
         egui::Align2::CENTER_CENTER,
         &label,
         FontId::proportional(11.0),
-        text_color,
+        if dark_mode { Color32::WHITE } else { Color32::BLACK },
     );
 }
 
-/// Draw a selection highlight around a node.
 fn draw_node_selection(painter: &Painter, nd: &NodeDrawData) {
-    let expanded = nd.rect.expand(3.0);
     painter.rect_stroke(
-        expanded,
+        nd.rect.expand(3.0),
         Rounding::same(NODE_ROUNDING + 3.0),
         Stroke::new(2.0, SELECT_COLOR),
     );
 }
 
-/// Draw a dashed rectangle border (approximate — walks the perimeter).
+/// Draw a semi-transparent ghost node at the cursor position for palette drags.
+fn draw_palette_ghost(
+    painter: &Painter,
+    xform: &Transform,
+    kind: NodeKind,
+    ptr: Pos2,
+    dark_mode: bool,
+) {
+    let cp = xform.to_canvas(ptr);
+    let ghost_tl = (cp.0 - NODE_W / 2.0, cp.1 - NODE_H / 2.0);
+    let tl = xform.to_screen(ghost_tl);
+    let rect = Rect::from_min_size(tl, Vec2::new(xform.scale(NODE_W), xform.scale(NODE_H)));
+
+    let base = node_fill(kind, dark_mode);
+    let ghost_fill = Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 160);
+    let stroke_color = node_stroke_color(kind, dark_mode);
+
+    painter.rect_filled(rect, Rounding::same(NODE_ROUNDING), ghost_fill);
+    draw_dashed_rect(painter, rect, Rounding::same(NODE_ROUNDING), Stroke::new(1.5, stroke_color));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        kind.label(),
+        FontId::proportional(11.0),
+        if dark_mode {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 200)
+        } else {
+            Color32::from_rgba_unmultiplied(0, 0, 0, 200)
+        },
+    );
+}
+
 fn draw_dashed_rect(painter: &Painter, rect: Rect, _rounding: Rounding, stroke: Stroke) {
     let corners = [
         rect.left_top(),
@@ -709,12 +832,10 @@ fn draw_dashed_rect(painter: &Painter, rect: Rect, _rounding: Rounding, stroke: 
         rect.left_top(),
     ];
     for window in corners.windows(2) {
-        let (a, b) = (window[0], window[1]);
-        draw_dashed_segment(painter, a, b, stroke, DASH_LEN, DASH_GAP);
+        draw_dashed_segment(painter, window[0], window[1], stroke, DASH_LEN, DASH_GAP);
     }
 }
 
-/// Draw a dashed line segment from `a` to `b`.
 fn draw_dashed_segment(painter: &Painter, a: Pos2, b: Pos2, stroke: Stroke, dash: f32, gap: f32) {
     let dir = (b - a).normalized();
     let total = (b - a).length();
@@ -743,16 +864,13 @@ fn draw_stream(
     let base_color = stream_color(dark_mode);
     let offset_vec = stream_offset(sd, group_offsets);
     let points: Vec<Pos2> = sd.points.iter().map(|&p| p + offset_vec).collect();
-
     if points.len() < 2 {
         return;
     }
-
     let stroke = Stroke::new(STREAM_STROKE, base_color);
     for window in points.windows(2) {
         painter.line_segment([window[0], window[1]], stroke);
     }
-
     if let (Some(&tip), Some(&before)) =
         (points.last(), points.get(points.len().saturating_sub(2)))
     {
@@ -760,7 +878,6 @@ fn draw_stream(
     }
 }
 
-/// Draw a selection highlight along a stream's path.
 fn draw_stream_selection(
     painter: &Painter,
     sd: &StreamDrawData,
@@ -774,7 +891,6 @@ fn draw_stream_selection(
     }
 }
 
-/// Compute the perpendicular group offset for a stream, or `Vec2::ZERO`.
 fn stream_offset(sd: &StreamDrawData, group_offsets: &HashMap<Uuid, Vec<Uuid>>) -> Vec2 {
     if let Some(gid) = sd.group_id {
         compute_group_offset(sd.stream_id, gid, group_offsets, &sd.points)
@@ -783,21 +899,17 @@ fn stream_offset(sd: &StreamDrawData, group_offsets: &HashMap<Uuid, Vec<Uuid>>) 
     }
 }
 
-/// Draw a small filled triangle arrowhead at `tip`, pointing from `from` → `tip`.
 fn draw_arrowhead(painter: &Painter, from: Pos2, tip: Pos2, half: f32, color: Color32) {
     let dir = (tip - from).normalized();
     let perp = Vec2::new(-dir.y, dir.x);
     let base = tip - dir * (half * 1.5);
-    let left = base + perp * half;
-    let right = base - perp * half;
     painter.add(egui::Shape::convex_polygon(
-        vec![tip, left, right],
+        vec![tip, base + perp * half, base - perp * half],
         color,
         Stroke::NONE,
     ));
 }
 
-/// Compute the perpendicular offset for a grouped stream.
 fn compute_group_offset(
     stream_id: Uuid,
     group_id: Uuid,
@@ -811,13 +923,11 @@ fn compute_group_offset(
     let slot = members.iter().position(|&id| id == stream_id).unwrap_or(0) as f32;
     let n = members.len() as f32;
     let centred_slot = slot - (n - 1.0) * 0.5;
-
     if points.len() < 2 {
         return Vec2::ZERO;
     }
     let seg_dir = (points[1] - points[0]).normalized();
-    let perp = Vec2::new(-seg_dir.y, seg_dir.x);
-    perp * (centred_slot * GROUP_OFFSET)
+    Vec2::new(-seg_dir.y, seg_dir.x) * (centred_slot * GROUP_OFFSET)
 }
 
 // ---------------------------------------------------------------------------
@@ -828,25 +938,13 @@ fn draw_node_badge(painter: &Painter, nd: &NodeDrawData) {
     let color = badge_color(nd.badge);
     let center = nd.rect.right_top() + Vec2::new(-BADGE_R, BADGE_R);
     painter.circle_filled(center, BADGE_R, color);
-    painter.text(
-        center,
-        egui::Align2::CENTER_CENTER,
-        badge_icon(nd.badge),
-        FontId::proportional(8.0),
-        Color32::WHITE,
-    );
+    painter.text(center, egui::Align2::CENTER_CENTER, badge_icon(nd.badge), FontId::proportional(8.0), Color32::WHITE);
 }
 
 fn draw_stream_badge(painter: &Painter, sd: &StreamDrawData) {
     let color = badge_color(sd.badge);
     painter.circle_filled(sd.midpoint, BADGE_R, color);
-    painter.text(
-        sd.midpoint,
-        egui::Align2::CENTER_CENTER,
-        badge_icon(sd.badge),
-        FontId::proportional(8.0),
-        Color32::WHITE,
-    );
+    painter.text(sd.midpoint, egui::Align2::CENTER_CENTER, badge_icon(sd.badge), FontId::proportional(8.0), Color32::WHITE);
 }
 
 fn badge_color(state: ValidationState) -> Color32 {
@@ -863,4 +961,34 @@ fn badge_icon(state: ValidationState) -> &'static str {
         ValidationState::Warning => "!",
         ValidationState::Error => "✕",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Node palette window
+// ---------------------------------------------------------------------------
+
+/// Render the floating node palette and detect palette-drag starts.
+fn show_node_palette(state: &mut AppState, ctx: &egui::Context) {
+    egui::Window::new("Nodes")
+        .resizable(false)
+        .default_pos([8.0, 60.0])
+        .min_width(96.0)
+        .show(ctx, |ui| {
+            for kind in [NodeKind::Source, NodeKind::Sink, NodeKind::Process] {
+                let resp = ui.add(
+                    egui::Button::new(kind.label())
+                        .min_size(egui::vec2(88.0, 22.0))
+                        .sense(egui::Sense::click_and_drag()),
+                );
+                // Drag starts when the button is pressed and the pointer moves.
+                if resp.drag_started() {
+                    state.drag_state.palette_drag = Some(kind);
+                }
+                resp.on_hover_text(match kind {
+                    NodeKind::Source => "Drag onto canvas to create a Source node",
+                    NodeKind::Sink => "Drag onto canvas to create a Sink node",
+                    NodeKind::Process => "Drag onto canvas to create a Process node",
+                });
+            }
+        });
 }

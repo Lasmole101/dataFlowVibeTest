@@ -10,6 +10,7 @@ fn main() -> eframe::Result<()> {
     eprintln!("DataFlow starting (debug build)");
 
     let native_options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("DataFlow")
             .with_inner_size([1280.0, 800.0])

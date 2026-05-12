@@ -34,7 +34,7 @@ use egui::{Context, FontId, RichText, Ui};
 use uuid::Uuid;
 
 use crate::{
-    model::project::Project,
+    model::{node::NodeKind, project::Project},
     ui::dialogs::{ConfirmDeleteDialog, CreateGroupDialog, RenameDialog, SetSubDiagramDialog},
     ui::dictionary_panel::DictionaryPanelState,
     ui::spec_panel::SpecPanelState,
@@ -68,12 +68,17 @@ pub enum ActivePanel {
 /// accidentally read stale drag progress from widget positions.
 #[derive(Debug, Default)]
 pub struct DragState {
-    /// Node being dragged: `(node_id, pointer_offset_from_node_origin_in_canvas_space)`.
-    pub dragging_node: Option<(Uuid, egui::Vec2)>,
+    /// Node being dragged: `(node_id, original_canvas_pos, pointer_offset_in_canvas_space)`.
+    ///
+    /// The original canvas position is stored so `MoveNode.from` can be set
+    /// correctly on drop without a second project lookup.
+    pub dragging_node: Option<(Uuid, (f32, f32), egui::Vec2)>,
     /// Stream creation in progress: `(source_node_id, current_pointer_in_canvas_space)`.
     pub creating_stream: Option<(Uuid, egui::Pos2)>,
     /// True while a middle-mouse pan that started over the canvas is in progress.
     pub mid_drag_active: bool,
+    /// Node kind being dragged from the node palette onto the canvas.
+    pub palette_drag: Option<NodeKind>,
 }
 
 // ---------------------------------------------------------------------------
