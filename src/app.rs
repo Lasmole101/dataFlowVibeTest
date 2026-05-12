@@ -72,6 +72,8 @@ pub struct DragState {
     pub dragging_node: Option<(Uuid, egui::Vec2)>,
     /// Stream creation in progress: `(source_node_id, current_pointer_in_canvas_space)`.
     pub creating_stream: Option<(Uuid, egui::Pos2)>,
+    /// True while a middle-mouse pan that started over the canvas is in progress.
+    pub mid_drag_active: bool,
 }
 
 // ---------------------------------------------------------------------------
