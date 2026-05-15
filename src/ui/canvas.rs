@@ -1,4 +1,4 @@
-//! Canvas drawing and interaction layer (spec §5.1, phases 8a–8c).
+//! Canvas drawing and interaction layer (spec §5.1, phases 8a–8d).
 //!
 //! Renders the active diagram's nodes, streams, and validation badges using
 //! the egui [`Painter`] API.
@@ -14,19 +14,13 @@
 //! Transform: `screen = (canvas - scroll) * zoom + panel_origin`
 //! Inverse:   `canvas = (screen - panel_origin) / zoom + scroll`
 //!
-//! # Node drag (phase 8c)
+//! # Interaction priority (phase 8d)
 //!
-//! Pressing the primary button over a node (without Space held) starts a drag.
-//! The node position is overridden live in [`collect_draw_data`] so the node
-//! follows the cursor.  On release a [`MoveNode`] command is dispatched with
-//! the before/after positions.  Positions snap to a 16-canvas-unit grid on drop.
-//!
-//! # Node palette (phase 8c)
-//!
-//! A small floating panel in the top-left corner lists Source / Sink / Process
-//! buttons.  Pressing and dragging a button begins a palette drag tracked in
-//! [`AppState::drag_state`].  Releasing over the canvas dispatches [`AddNode`]
-//! at the snapped drop position, centred on the cursor.
+//! Within a single `drag_started()` frame, the following checks run in order:
+//! 1. Output handle hit → start stream creation
+//! 2. Stream endpoint hit (if stream selected) → start reconnect
+//! 3. Node body hit (not near a handle) → start node drag
+//! Palette drag is detected separately in the floating palette window.
 
 use std::collections::HashMap;
 
@@ -34,12 +28,16 @@ use egui::{Color32, CursorIcon, FontId, Painter, Pos2, Rect, Rounding, Stroke, V
 use uuid::Uuid;
 
 use crate::{
-    app::{ActivePanel, AppState},
+    app::{ActivePanel, AppState, ContextTarget},
     model::{
         diagram::Diagram,
         node::{Node, NodeKind},
+        stream::Stream,
     },
-    undo::commands::{AddNode, MoveNode},
+    undo::{
+        commands::{AddNode, AddStream, CreateSubDiagram, DeleteNode, DeleteStream, MoveNode},
+        history::CompoundCommand,
+    },
     validation::validator::ValidationState,
 };
 
@@ -86,6 +84,10 @@ const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 20.0;
 /// Grid snap size in canvas units (applied on node drop).
 const SNAP_GRID: f32 = 16.0;
+/// Radius of connection handle circles in screen pixels.
+const HANDLE_R: f32 = 5.0;
+/// Hit radius for connection handle detection (larger than visual for easier clicking).
+const HANDLE_HIT_R: f32 = 8.0;
 
 // ---------------------------------------------------------------------------
 // Node colours
@@ -128,6 +130,30 @@ fn stream_color(dark_mode: bool) -> Color32 {
         Color32::from_rgb(180, 180, 180)
     } else {
         Color32::from_rgb(80, 80, 80)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection handle position helpers
+// ---------------------------------------------------------------------------
+
+/// Screen-space position of the output (right-edge) connection handle, or `None`
+/// if the node kind cannot produce outputs.
+fn output_handle_pos(rect: Rect, kind: NodeKind) -> Option<Pos2> {
+    if kind.produces_outputs() {
+        Some(Pos2::new(rect.max.x, rect.center().y))
+    } else {
+        None
+    }
+}
+
+/// Screen-space position of the input (left-edge) connection handle, or `None`
+/// if the node kind cannot accept inputs.
+fn input_handle_pos(rect: Rect, kind: NodeKind) -> Option<Pos2> {
+    if kind.accepts_inputs() {
+        Some(Pos2::new(rect.min.x, rect.center().y))
+    } else {
+        None
     }
 }
 
@@ -223,25 +249,44 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
         origin: panel_rect.min,
     };
 
-    // -----------------------------------------------------------------------
-    // Node drag — START
-    // Detected before collect_draw_data so the override is active from the
-    // first frame of movement (the very first frame uses the original pos).
-    // -----------------------------------------------------------------------
     let is_panning = space_down || state.drag_state.mid_drag_active;
-    if response.drag_started()
-        && !is_panning
-        && state.drag_state.dragging_node.is_none()
-        && state.drag_state.palette_drag.is_none()
-    {
+
+    // -----------------------------------------------------------------------
+    // Drag detection — all three types checked in priority order so only one
+    // starts per drag_started() frame.
+    // -----------------------------------------------------------------------
+    let no_active_drag = state.drag_state.dragging_node.is_none()
+        && state.drag_state.creating_stream.is_none()
+        && state.drag_state.reconnecting_stream.is_none()
+        && state.drag_state.palette_drag.is_none();
+
+    if response.drag_started() && !is_panning && no_active_drag {
         let ptr = ui.input(|i| i.pointer.interact_pos());
         if let Some(ptr) = ptr {
-            if let Some((node_id, orig_pos)) = quick_hit_test_nodes(&diagram, &xform, ptr) {
+            // 1. Output handle → stream creation
+            if let Some(source_id) = quick_hit_output_handle(&diagram, &xform, ptr) {
+                state.drag_state.creating_stream = Some((source_id, ptr));
+            }
+            // 2. Selected stream endpoint → reconnect
+            else if let Some(rs) = detect_reconnect_start(&diagram, &xform, state.selected_id, ptr) {
+                state.drag_state.reconnecting_stream = Some(rs);
+            }
+            // 3. Node body (only if not on a handle) → node drag
+            else if let Some((node_id, orig_pos)) = quick_hit_test_nodes(&diagram, &xform, ptr) {
                 let canvas_ptr = xform.to_canvas(ptr);
                 let offset = Vec2::new(canvas_ptr.0 - orig_pos.0, canvas_ptr.1 - orig_pos.1);
                 state.drag_state.dragging_node = Some((node_id, orig_pos, offset));
                 state.selected_id = Some(node_id);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Update creating_stream pointer position each frame
+    // -----------------------------------------------------------------------
+    if let Some((_, ref mut cur_ptr)) = state.drag_state.creating_stream {
+        if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
+            *cur_ptr = ptr;
         }
     }
 
@@ -295,17 +340,122 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     }
 
     // -----------------------------------------------------------------------
+    // Stream creation — END
+    // -----------------------------------------------------------------------
+    if response.drag_stopped() {
+        if let Some((source_id, _)) = state.drag_state.creating_stream.take() {
+            let ptr = ui.input(|i| i.pointer.hover_pos());
+            let target_id = ptr.and_then(|p| {
+                quick_hit_test_nodes(&diagram, &xform, p)
+                    .filter(|(nid, _)| *nid != source_id)
+                    .map(|(nid, _)| nid)
+            });
+
+            let source_ok = diagram
+                .nodes
+                .get(&source_id)
+                .map(|n| n.kind.produces_outputs())
+                .unwrap_or(false);
+
+            if let Some(tgt_id) = target_id {
+                let target_ok = diagram
+                    .nodes
+                    .get(&tgt_id)
+                    .map(|n| n.kind.accepts_inputs())
+                    .unwrap_or(false);
+
+                if source_ok && target_ok {
+                    let stream = Stream::new(source_id, tgt_id);
+                    let stream_id = stream.id;
+                    let cmd = AddStream { diagram_id: state.active_diagram_id, stream };
+                    if let Err(e) =
+                        state.undo_stack.execute(Box::new(cmd), &mut state.project)
+                    {
+                        state.set_status(format!("Add stream failed: {e}"));
+                    } else {
+                        state.dirty = true;
+                        state.selected_id = Some(stream_id);
+                        state.validation.validate_incremental(stream_id, &state.project);
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream endpoint reconnect — END
+    // -----------------------------------------------------------------------
+    if response.drag_stopped() {
+        if let Some((stream_id, is_source_end, fixed_node_id)) =
+            state.drag_state.reconnecting_stream.take()
+        {
+            let ptr = ui.input(|i| i.pointer.hover_pos());
+            let new_node_id = ptr.and_then(|p| {
+                quick_hit_test_nodes(&diagram, &xform, p)
+                    .filter(|(nid, _)| *nid != fixed_node_id)
+                    .map(|(nid, _)| nid)
+            });
+
+            if let Some(new_id) = new_node_id {
+                let (new_src, new_tgt) = if is_source_end {
+                    (new_id, fixed_node_id)
+                } else {
+                    (fixed_node_id, new_id)
+                };
+
+                let src_ok = diagram
+                    .nodes
+                    .get(&new_src)
+                    .map(|n| n.kind.produces_outputs())
+                    .unwrap_or(false);
+                let tgt_ok = diagram
+                    .nodes
+                    .get(&new_tgt)
+                    .map(|n| n.kind.accepts_inputs())
+                    .unwrap_or(false);
+
+                if src_ok && tgt_ok {
+                    if let Some(old_stream) = diagram.streams.get(&stream_id).cloned() {
+                        let new_stream = Stream::new(new_src, new_tgt);
+                        let new_stream_id = new_stream.id;
+                        let compound = CompoundCommand::new(
+                            "Reconnect stream",
+                            vec![
+                                Box::new(DeleteStream {
+                                    diagram_id: state.active_diagram_id,
+                                    stream: old_stream,
+                                }),
+                                Box::new(AddStream {
+                                    diagram_id: state.active_diagram_id,
+                                    stream: new_stream,
+                                }),
+                            ],
+                        );
+                        if let Err(e) =
+                            state.undo_stack.execute(Box::new(compound), &mut state.project)
+                        {
+                            state.set_status(format!("Reconnect stream failed: {e}"));
+                        } else {
+                            state.dirty = true;
+                            state.selected_id = Some(new_stream_id);
+                            state.validation.validate_incremental(new_stream_id, &state.project);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Palette drag — DROP (primary button released anywhere)
     // -----------------------------------------------------------------------
     let primary_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
     if primary_released {
-        // palette_drag is Copy (NodeKind is Copy), so we can read and then clear.
         if let Some(kind) = state.drag_state.palette_drag {
             state.drag_state.palette_drag = None;
             if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
                 if panel_rect.contains(ptr) {
                     let cp = xform.to_canvas(ptr);
-                    // Centre the new node on the drop position then snap.
                     let node_pos =
                         snap_to_grid((cp.0 - NODE_W / 2.0, cp.1 - NODE_H / 2.0));
                     let name = next_node_name(&diagram, kind);
@@ -333,13 +483,17 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         state.drag_state.dragging_node = None;
         state.drag_state.palette_drag = None;
+        state.drag_state.creating_stream = None;
+        state.drag_state.reconnecting_stream = None;
     }
 
     // -----------------------------------------------------------------------
-    // Click — selection (suppressed while a node/palette drag is in progress)
+    // Click — selection (suppressed while any drag is in progress)
     // -----------------------------------------------------------------------
-    let dragging_anything =
-        state.drag_state.dragging_node.is_some() || state.drag_state.palette_drag.is_some();
+    let dragging_anything = state.drag_state.dragging_node.is_some()
+        || state.drag_state.palette_drag.is_some()
+        || state.drag_state.creating_stream.is_some()
+        || state.drag_state.reconnecting_stream.is_some();
 
     if !dragging_anything {
         let interact_pos = ui.input(|i| i.pointer.interact_pos());
@@ -364,13 +518,33 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     }
 
     // -----------------------------------------------------------------------
-    // Cursor icon — grab cursor when hovering over a draggable node
+    // Right-click — capture context menu target (before context_menu() call)
+    // -----------------------------------------------------------------------
+    if response.secondary_clicked() {
+        let ptr = ui.input(|i| i.pointer.interact_pos());
+        state.context_menu_target = ptr.and_then(|p| hit_test(&draw_data, p)).map(|id| {
+            if diagram.nodes.contains_key(&id) {
+                ContextTarget::Node(id)
+            } else {
+                ContextTarget::Stream(id)
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor icon
     // -----------------------------------------------------------------------
     if !is_panning {
         if state.drag_state.dragging_node.is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if state.drag_state.creating_stream.is_some()
+            || state.drag_state.reconnecting_stream.is_some()
+        {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
         } else if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
-            if quick_hit_test_nodes(&diagram, &xform, ptr).is_some() {
+            if quick_hit_output_handle(&diagram, &xform, ptr).is_some() {
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+            } else if quick_hit_test_nodes(&diagram, &xform, ptr).is_some() {
                 ui.ctx().set_cursor_icon(CursorIcon::Grab);
             }
         }
@@ -443,6 +617,83 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Connection handles (visible on node hover when not in a drag)
+    // -----------------------------------------------------------------------
+    if !dragging_anything {
+        let hover_pos = ui.input(|i| i.pointer.hover_pos());
+        for nd in &draw_data.nodes {
+            let hovered = hover_pos.map(|p| nd.rect.contains(p)).unwrap_or(false);
+            if hovered {
+                draw_node_handles(&painter, nd);
+            }
+        }
+    }
+
+    // Stream endpoint handles on selected stream (for reconnect dragging).
+    if let Some(sel_id) = state.selected_id {
+        if let Some(sel_sd) = draw_data.streams.iter().find(|s| s.stream_id == sel_id) {
+            if let (Some(&first), Some(&last)) =
+                (sel_sd.points.first(), sel_sd.points.last())
+            {
+                painter.circle_filled(first, HANDLE_R, SELECT_COLOR);
+                painter.circle_filled(last, HANDLE_R, SELECT_COLOR);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream creation preview line
+    // -----------------------------------------------------------------------
+    if let Some((source_id, current_ptr)) = state.drag_state.creating_stream {
+        if let Some(src_nd) = draw_data.nodes.iter().find(|n| n.node_id == source_id) {
+            if let Some(src_handle) = output_handle_pos(src_nd.rect, src_nd.kind) {
+                let line_color = Color32::from_rgba_unmultiplied(80, 180, 255, 200);
+                painter.line_segment(
+                    [src_handle, current_ptr],
+                    Stroke::new(2.0, line_color),
+                );
+                painter.circle_filled(src_handle, HANDLE_R, line_color);
+                // Highlight target node input handle if hovering over a valid target.
+                if let Some(tgt_nd) = draw_data
+                    .nodes
+                    .iter()
+                    .find(|n| n.rect.contains(current_ptr) && n.node_id != source_id)
+                {
+                    if tgt_nd.kind.accepts_inputs() {
+                        if let Some(tgt_handle) = input_handle_pos(tgt_nd.rect, tgt_nd.kind) {
+                            painter.circle_filled(
+                                tgt_handle,
+                                HANDLE_R + 2.0,
+                                Color32::from_rgba_unmultiplied(80, 220, 80, 220),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream endpoint reconnect preview line
+    // -----------------------------------------------------------------------
+    if let Some((_stream_id, is_source_end, fixed_node_id)) = state.drag_state.reconnecting_stream {
+        let current_ptr = ui.input(|i| i.pointer.hover_pos()).unwrap_or(Pos2::ZERO);
+        if let Some(fixed_nd) = draw_data.nodes.iter().find(|n| n.node_id == fixed_node_id) {
+            // Fixed end is opposite side from the dragged end.
+            let fixed_pt = if is_source_end {
+                input_handle_pos(fixed_nd.rect, fixed_nd.kind)
+                    .unwrap_or(fixed_nd.rect.left_center())
+            } else {
+                output_handle_pos(fixed_nd.rect, fixed_nd.kind)
+                    .unwrap_or(fixed_nd.rect.right_center())
+            };
+            let line_color = Color32::from_rgba_unmultiplied(255, 160, 80, 200);
+            painter.line_segment([fixed_pt, current_ptr], Stroke::new(2.0, line_color));
+            painter.circle_filled(fixed_pt, HANDLE_R, line_color);
+        }
+    }
+
     // Ghost node while dragging from palette.
     if let Some(kind) = state.drag_state.palette_drag {
         if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
@@ -451,6 +702,23 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Context menu (consumes `response` — must be last)
+    // -----------------------------------------------------------------------
+    response.context_menu(|ui| {
+        match state.context_menu_target {
+            Some(ContextTarget::Node(node_id)) => {
+                show_node_context_menu(state, &diagram, node_id, ui);
+            }
+            Some(ContextTarget::Stream(stream_id)) => {
+                show_stream_context_menu(state, &diagram, stream_id, ui);
+            }
+            None => {
+                ui.close_menu();
+            }
+        }
+    });
 
     // -----------------------------------------------------------------------
     // Node palette window
@@ -529,7 +797,6 @@ fn collect_draw_data(
         group_offsets.insert(*gid, group.member_stream_ids.clone());
     }
 
-    // Build node screen rects, applying the live drag override.
     let node_rects: HashMap<Uuid, Rect> = diagram
         .nodes
         .keys()
@@ -590,7 +857,7 @@ fn collect_draw_data(
 
 /// Attach validation badge states — separate pass to keep collect_draw_data
 /// free of validation imports.
-pub fn apply_badges(data: &mut DiagramDrawData, state: &AppState) {
+pub(crate) fn apply_badges(data: &mut DiagramDrawData, state: &AppState) {
     for nd in &mut data.nodes {
         nd.badge = state.validation.state(nd.node_id);
     }
@@ -620,7 +887,6 @@ fn mark_selected(data: &mut DiagramDrawData, selected_id: Option<Uuid>) {
 /// Return the UUID of the topmost node or stream under screen-space `pos`,
 /// or `None`.  Nodes take priority over streams.
 fn hit_test(draw_data: &DiagramDrawData, pos: Pos2) -> Option<Uuid> {
-    // Nodes are drawn sorted by UUID ascending; test in reverse (visually topmost first).
     for nd in draw_data.nodes.iter().rev() {
         if nd.rect.contains(pos) {
             return Some(nd.node_id);
@@ -634,10 +900,9 @@ fn hit_test(draw_data: &DiagramDrawData, pos: Pos2) -> Option<Uuid> {
     None
 }
 
-/// Quickly find a node under screen-space `ptr` using diagram data directly
-/// (without a full DrawData pass).  Returns `(node_id, canvas_tl)` or `None`.
+/// Find a node under `ptr` using diagram data directly (before draw data is built).
+/// Returns `(node_id, canvas_tl)` or `None`.
 fn quick_hit_test_nodes(diagram: &Diagram, xform: &Transform, ptr: Pos2) -> Option<(Uuid, (f32, f32))> {
-    // Test in reverse sort order so visually-topmost node wins.
     let mut ids: Vec<Uuid> = diagram.nodes.keys().copied().collect();
     ids.sort_by(|a, b| b.cmp(a));
     for nid in ids {
@@ -649,6 +914,68 @@ fn quick_hit_test_nodes(diagram: &Diagram, xform: &Transform, ptr: Pos2) -> Opti
         }
     }
     None
+}
+
+/// Find a node whose **output handle** is within `HANDLE_HIT_R` of `ptr`.
+fn quick_hit_output_handle(diagram: &Diagram, xform: &Transform, ptr: Pos2) -> Option<Uuid> {
+    for (&nid, node) in &diagram.nodes {
+        if !node.kind.produces_outputs() {
+            continue;
+        }
+        let pos = diagram.positions.get(&nid).copied().unwrap_or((0.0, 0.0));
+        let tl = xform.to_screen(pos);
+        let br = tl + Vec2::new(xform.scale(NODE_W), xform.scale(NODE_H));
+        let handle = Pos2::new(br.x, (tl.y + br.y) * 0.5);
+        if (ptr - handle).length() <= HANDLE_HIT_R {
+            return Some(nid);
+        }
+    }
+    None
+}
+
+/// Check if `ptr` is near either endpoint of the currently selected stream.
+/// Returns `(stream_id, is_source_end, fixed_node_id)` on a hit.
+fn detect_reconnect_start(
+    diagram: &Diagram,
+    xform: &Transform,
+    selected_id: Option<Uuid>,
+    ptr: Pos2,
+) -> Option<(Uuid, bool, Uuid)> {
+    let sel_id = selected_id?;
+    let stream = diagram.streams.get(&sel_id)?;
+    if stream.is_dangling {
+        return None;
+    }
+    let (src_pt, tgt_pt) = stream_endpoint_screen_pos(stream, diagram, xform)?;
+    if (ptr - src_pt).length() <= HANDLE_HIT_R {
+        return Some((sel_id, true, stream.target_node_id));
+    }
+    if (ptr - tgt_pt).length() <= HANDLE_HIT_R {
+        return Some((sel_id, false, stream.source_node_id));
+    }
+    None
+}
+
+/// Compute the screen-space positions of a stream's source-exit and
+/// target-entry points, mirroring [`compute_stream_path`].
+fn stream_endpoint_screen_pos(
+    stream: &Stream,
+    diagram: &Diagram,
+    xform: &Transform,
+) -> Option<(Pos2, Pos2)> {
+    let src_pos = diagram.positions.get(&stream.source_node_id).copied()?;
+    let tgt_pos = diagram.positions.get(&stream.target_node_id).copied()?;
+    let src_tl = xform.to_screen(src_pos);
+    let src_br = src_tl + Vec2::new(xform.scale(NODE_W), xform.scale(NODE_H));
+    let tgt_tl = xform.to_screen(tgt_pos);
+    let tgt_br = tgt_tl + Vec2::new(xform.scale(NODE_W), xform.scale(NODE_H));
+    let (src_cx, src_cy) = ((src_tl.x + src_br.x) * 0.5, (src_tl.y + src_br.y) * 0.5);
+    let (tgt_cx, tgt_cy) = ((tgt_tl.x + tgt_br.x) * 0.5, (tgt_tl.y + tgt_br.y) * 0.5);
+    if src_cx <= tgt_cx {
+        Some((Pos2::new(src_br.x, src_cy), Pos2::new(tgt_tl.x, tgt_cy)))
+    } else {
+        Some((Pos2::new(src_cx, src_br.y), Pos2::new(tgt_cx, tgt_tl.y)))
+    }
 }
 
 fn hit_test_polyline(pos: Pos2, points: &[Pos2], tolerance: f32) -> bool {
@@ -675,7 +1002,6 @@ fn dist_point_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 // Grid snap
 // ---------------------------------------------------------------------------
 
-/// Snap a canvas-space position to the nearest 16-unit grid point.
 fn snap_to_grid(pos: (f32, f32)) -> (f32, f32) {
     (
         (pos.0 / SNAP_GRID).round() * SNAP_GRID,
@@ -687,7 +1013,6 @@ fn snap_to_grid(pos: (f32, f32)) -> (f32, f32) {
 // Node naming helper
 // ---------------------------------------------------------------------------
 
-/// Generate a default name for a new node of `kind` based on existing counts.
 fn next_node_name(diagram: &Diagram, kind: NodeKind) -> String {
     let count = diagram.nodes.values().filter(|n| n.kind == kind).count();
     format!("{} {}", kind.label(), count + 1)
@@ -789,6 +1114,20 @@ fn draw_node_selection(painter: &Painter, nd: &NodeDrawData) {
         Rounding::same(NODE_ROUNDING + 3.0),
         Stroke::new(2.0, SELECT_COLOR),
     );
+}
+
+/// Draw small connection-handle circles on a node's relevant edges.
+fn draw_node_handles(painter: &Painter, nd: &NodeDrawData) {
+    let ring = Color32::WHITE;
+    let border = SELECT_COLOR;
+    if let Some(pos) = output_handle_pos(nd.rect, nd.kind) {
+        painter.circle_filled(pos, HANDLE_R, ring);
+        painter.circle_stroke(pos, HANDLE_R, Stroke::new(1.5, border));
+    }
+    if let Some(pos) = input_handle_pos(nd.rect, nd.kind) {
+        painter.circle_filled(pos, HANDLE_R, ring);
+        painter.circle_stroke(pos, HANDLE_R, Stroke::new(1.5, border));
+    }
 }
 
 /// Draw a semi-transparent ghost node at the cursor position for palette drags.
@@ -938,13 +1277,25 @@ fn draw_node_badge(painter: &Painter, nd: &NodeDrawData) {
     let color = badge_color(nd.badge);
     let center = nd.rect.right_top() + Vec2::new(-BADGE_R, BADGE_R);
     painter.circle_filled(center, BADGE_R, color);
-    painter.text(center, egui::Align2::CENTER_CENTER, badge_icon(nd.badge), FontId::proportional(8.0), Color32::WHITE);
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        badge_icon(nd.badge),
+        FontId::proportional(8.0),
+        Color32::WHITE,
+    );
 }
 
 fn draw_stream_badge(painter: &Painter, sd: &StreamDrawData) {
     let color = badge_color(sd.badge);
     painter.circle_filled(sd.midpoint, BADGE_R, color);
-    painter.text(sd.midpoint, egui::Align2::CENTER_CENTER, badge_icon(sd.badge), FontId::proportional(8.0), Color32::WHITE);
+    painter.text(
+        sd.midpoint,
+        egui::Align2::CENTER_CENTER,
+        badge_icon(sd.badge),
+        FontId::proportional(8.0),
+        Color32::WHITE,
+    );
 }
 
 fn badge_color(state: ValidationState) -> Color32 {
@@ -960,6 +1311,132 @@ fn badge_icon(state: ValidationState) -> &'static str {
         ValidationState::Ok => "",
         ValidationState::Warning => "!",
         ValidationState::Error => "✕",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context menu helpers
+// ---------------------------------------------------------------------------
+
+/// Show the right-click context menu for a node.
+fn show_node_context_menu(
+    state: &mut AppState,
+    diagram: &Diagram,
+    node_id: Uuid,
+    ui: &mut egui::Ui,
+) {
+    let Some(node) = diagram.nodes.get(&node_id) else {
+        ui.close_menu();
+        return;
+    };
+
+    if ui.button("Open Spec").clicked() {
+        state.selected_id = Some(node_id);
+        state.active_panel = ActivePanel::Spec(node_id);
+        ui.close_menu();
+    }
+
+    if node.is_deletable() && ui.button("Delete").clicked() {
+        delete_node_with_streams(state, diagram, node_id, node);
+        if state.selected_id == Some(node_id) {
+            state.selected_id = None;
+        }
+        ui.close_menu();
+    }
+
+    if node.kind == NodeKind::Process {
+        if !node.has_subdiagram() && ui.button("Create Sub-diagram").clicked() {
+            let cmd = CreateSubDiagram {
+                parent_diagram_id: state.active_diagram_id,
+                process_node_id: node_id,
+                sub_diagram_id: Uuid::new_v4(),
+            };
+            if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+                state.set_status(format!("Create sub-diagram failed: {e}"));
+            } else {
+                state.dirty = true;
+                state.validation.validate_full(&state.project);
+            }
+            ui.close_menu();
+        }
+
+        let has_orphans = !state.project.orphaned_diagram_ids.is_empty();
+        if has_orphans && ui.button("Set Sub-diagram…").clicked() {
+            let orphan_list: Vec<(Uuid, String)> = state
+                .project
+                .orphaned_diagram_ids
+                .iter()
+                .filter_map(|&id| {
+                    state.project.diagram(id).map(|d| (id, d.name.clone()))
+                })
+                .collect();
+            state.dialogs.set_subdiagram.open_for(node_id, orphan_list);
+            ui.close_menu();
+        }
+    }
+}
+
+/// Show the right-click context menu for a stream.
+fn show_stream_context_menu(
+    state: &mut AppState,
+    diagram: &Diagram,
+    stream_id: Uuid,
+    ui: &mut egui::Ui,
+) {
+    let Some(stream) = diagram.streams.get(&stream_id) else {
+        ui.close_menu();
+        return;
+    };
+    let src_id = stream.source_node_id;
+    let tgt_id = stream.target_node_id;
+    let stream_clone = stream.clone();
+
+    if ui.button("Open Spec").clicked() {
+        state.selected_id = Some(stream_id);
+        state.active_panel = ActivePanel::Spec(stream_id);
+        ui.close_menu();
+    }
+
+    if ui.button("Delete").clicked() {
+        let cmd = DeleteStream { diagram_id: state.active_diagram_id, stream: stream_clone };
+        if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+            state.set_status(format!("Delete stream failed: {e}"));
+        } else {
+            state.dirty = true;
+            if state.selected_id == Some(stream_id) {
+                state.selected_id = None;
+            }
+            state.validation.validate_incremental(src_id, &state.project);
+            state.validation.validate_incremental(tgt_id, &state.project);
+        }
+        ui.close_menu();
+    }
+}
+
+/// Delete a node together with all streams that touch it.
+fn delete_node_with_streams(
+    state: &mut AppState,
+    diagram: &Diagram,
+    node_id: Uuid,
+    node: &Node,
+) {
+    let diagram_id = state.active_diagram_id;
+    let position = diagram.positions.get(&node_id).copied().unwrap_or((0.0, 0.0));
+
+    let mut cmds: Vec<Box<dyn crate::undo::history::Command>> = Vec::new();
+
+    // Delete all streams touching this node first (pre-condition for DeleteNode).
+    for stream in diagram.streams.values().filter(|s| s.touches_node(node_id)) {
+        cmds.push(Box::new(DeleteStream { diagram_id, stream: stream.clone() }));
+    }
+    cmds.push(Box::new(DeleteNode { diagram_id, node: node.clone(), position }));
+
+    let compound = CompoundCommand::new("Delete node", cmds);
+    if let Err(e) = state.undo_stack.execute(Box::new(compound), &mut state.project) {
+        state.set_status(format!("Delete node failed: {e}"));
+    } else {
+        state.dirty = true;
+        state.validation.validate_full(&state.project);
     }
 }
 
@@ -980,7 +1457,6 @@ fn show_node_palette(state: &mut AppState, ctx: &egui::Context) {
                         .min_size(egui::vec2(88.0, 22.0))
                         .sense(egui::Sense::click_and_drag()),
                 );
-                // Drag starts when the button is pressed and the pointer moves.
                 if resp.drag_started() {
                     state.drag_state.palette_drag = Some(kind);
                 }

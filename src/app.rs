@@ -30,7 +30,7 @@
 //! frame.
 
 use eframe::CreationContext;
-use egui::{Context, FontId, RichText, Ui};
+use egui::{Context, FontId, Pos2, RichText, Ui};
 use uuid::Uuid;
 
 use crate::{
@@ -41,6 +41,17 @@ use crate::{
     undo::history::UndoStack,
     validation::validator::ValidationCache,
 };
+
+// ---------------------------------------------------------------------------
+// ContextTarget
+// ---------------------------------------------------------------------------
+
+/// Identifies the target of a right-click context menu on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextTarget {
+    Node(Uuid),
+    Stream(Uuid),
+}
 
 // ---------------------------------------------------------------------------
 // ActivePanel
@@ -73,12 +84,18 @@ pub struct DragState {
     /// The original canvas position is stored so `MoveNode.from` can be set
     /// correctly on drop without a second project lookup.
     pub dragging_node: Option<(Uuid, (f32, f32), egui::Vec2)>,
-    /// Stream creation in progress: `(source_node_id, current_pointer_in_canvas_space)`.
-    pub creating_stream: Option<(Uuid, egui::Pos2)>,
+    /// Stream creation in progress: `(source_node_id, current_pointer_screen_pos)`.
+    pub creating_stream: Option<(Uuid, Pos2)>,
     /// True while a middle-mouse pan that started over the canvas is in progress.
     pub mid_drag_active: bool,
     /// Node kind being dragged from the node palette onto the canvas.
     pub palette_drag: Option<NodeKind>,
+    /// Stream endpoint reconnect in progress:
+    /// `(stream_id, is_source_end, fixed_node_id)`.
+    ///
+    /// `is_source_end = true` means the source endpoint is being dragged;
+    /// `fixed_node_id` is then the target node (which stays put).
+    pub reconnecting_stream: Option<(Uuid, bool, Uuid)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +151,9 @@ pub struct AppState {
     // ---- Canvas interaction ----
     /// Persistent drag state for the canvas.
     pub drag_state: DragState,
+    /// The component targeted by the most recent canvas right-click.
+    /// Used to persist the hit-test result across context-menu frames.
+    pub context_menu_target: Option<ContextTarget>,
 
     // ---- Dialogs ----
     /// All modal dialog states.
@@ -165,6 +185,7 @@ impl AppState {
             tree_pane_width: 220.0,
             tree_pane_visible: true,
             drag_state: DragState::default(),
+            context_menu_target: None,
             dialogs: DialogState::default(),
             current_file: None,
             dirty: false,
