@@ -14,8 +14,8 @@
 //!
 //! # File actions
 //!
-//! Open / Save / Save As are currently stubs that post a status message.
-//! They will be wired to [`crate::persistence::xml`] in Phase 7.
+//! Open / Save / Save As use [`rfd`] for native file dialogs and delegate to
+//! [`crate::persistence::xml`] for serialisation / deserialisation.
 //!
 //! # Undo / Redo
 //!
@@ -314,27 +314,66 @@ fn action_new(state: &mut AppState) {
     state.set_status("New project created.");
 }
 
-/// Open a project from disk (Phase 7 stub).
+/// Open a project from a file chosen via a native dialog.
 fn action_open(state: &mut AppState) {
-    // Phase 7: use `rfd` to pick a file, then call `persistence::xml::load_project_from_file`.
-    state.set_status("Open — not yet implemented (Phase 7).");
+    let path = rfd::FileDialog::new()
+        .add_filter("DataFlow Project", &["xml"])
+        .pick_file();
+
+    let Some(path) = path else { return };
+
+    match crate::persistence::xml::load_project_from_file(&path) {
+        Ok(project) => {
+            let root_id = project.root_diagram_id;
+            state.project = project;
+            state.active_diagram_id = root_id;
+            state.undo_stack.clear();
+            state.validation.validate_full(&state.project);
+            state.selected_id = None;
+            state.active_panel = ActivePanel::None;
+            state.current_file = Some(path);
+            state.dirty = false;
+            state.set_status("Project opened.");
+        }
+        Err(e) => state.set_status(format!("Open failed: {e}")),
+    }
 }
 
 /// Save to the current file path, or delegate to Save As if none is set.
 fn action_save(state: &mut AppState) {
-    if state.current_file.is_some() {
-        // Phase 7: call `persistence::xml::save_project_to_file`.
-        state.dirty = false;
-        state.set_status("Save — not yet implemented (Phase 7).");
+    // Clone the path to avoid a split borrow of `state`.
+    let path = state.current_file.clone();
+    if let Some(path) = path {
+        do_save(state, &path);
     } else {
         action_save_as(state);
     }
 }
 
-/// Save to a new file path chosen by the user (Phase 7 stub).
+/// Save to a new file path chosen via a native dialog.
 fn action_save_as(state: &mut AppState) {
-    // Phase 7: use `rfd` to pick a path, then call `persistence::xml::save_project_to_file`.
-    state.set_status("Save As — not yet implemented (Phase 7).");
+    let path = rfd::FileDialog::new()
+        .add_filter("DataFlow Project", &["xml"])
+        .set_file_name("project.xml")
+        .save_file();
+
+    let Some(path) = path else { return };
+
+    // Remember the path first so `do_save` can use it.
+    state.current_file = Some(path.clone());
+    do_save(state, &path);
+}
+
+/// Write the project to `path` and update dirty/status accordingly.
+fn do_save(state: &mut AppState, path: &std::path::Path) {
+    match crate::persistence::xml::save_project_to_file(&state.project, path) {
+        Ok(()) => {
+            state.dirty = false;
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            state.set_status(format!("Saved to {name}."));
+        }
+        Err(e) => state.set_status(format!("Save failed: {e}")),
+    }
 }
 
 /// Undo the most recent command.
