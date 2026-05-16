@@ -1099,11 +1099,10 @@ fn draw_node(painter: &Painter, nd: &NodeDrawData, dark_mode: bool) {
         painter.rect_stroke(nd.rect, rounding, Stroke::new(NODE_STROKE, stroke_color));
     }
 
-    let label = format!("{}\n{}", nd.name, nd.kind.label());
     painter.text(
         nd.rect.center(),
         egui::Align2::CENTER_CENTER,
-        &label,
+        &nd.name,
         FontId::proportional(11.0),
         if dark_mode { Color32::WHITE } else { Color32::BLACK },
     );
