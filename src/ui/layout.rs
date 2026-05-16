@@ -122,18 +122,30 @@ pub fn auto_layout(diagram: &Diagram) -> HashMap<Uuid, (f32, f32)> {
         *r += 1;
     }
 
-    // ── Convert column/row to canvas (x, y) ──────────────────────────────
+    // ── Convert column/row to canvas (x, y), then centre around (0, 0) ────
     let col_step = NODE_W + H_GAP;
     let row_step = NODE_H + V_GAP;
 
-    node_ids
-        .into_iter()
-        .map(|id| {
+    // Raw positions (top-left corner of each node box).
+    let raw: HashMap<Uuid, (f32, f32)> = node_ids
+        .iter()
+        .map(|&id| {
             let x = column[&id] as f32 * col_step;
             let y = row[&id] as f32 * row_step;
             (id, (x, y))
         })
-        .collect()
+        .collect();
+
+    // Bounding-box of all node top-left corners + node size.
+    let min_x = raw.values().map(|p| p.0).fold(f32::INFINITY, f32::min);
+    let min_y = raw.values().map(|p| p.1).fold(f32::INFINITY, f32::min);
+    let max_x = raw.values().map(|p| p.0 + NODE_W).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = raw.values().map(|p| p.1 + NODE_H).fold(f32::NEG_INFINITY, f32::max);
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+
+    // Shift every position so the bounding-box centre lands at canvas (0, 0).
+    raw.into_iter().map(|(id, (x, y))| (id, (x - cx, y - cy))).collect()
 }
 
 /// Build a [`CompoundCommand`] that moves every node in `diagram` to its

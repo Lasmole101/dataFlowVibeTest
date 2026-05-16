@@ -165,6 +165,11 @@ pub struct AppState {
     /// Unsaved-changes flag.  Set by every undo command; cleared on save.
     pub dirty: bool,
 
+    // ---- Canvas metrics ----
+    /// Size of the central canvas panel as of the last rendered frame.
+    /// Updated by `canvas::show` so layout actions can compute viewport centres.
+    pub last_canvas_size: egui::Vec2,
+
     // ---- Status bar ----
     /// Short message shown in the status bar (cleared each frame after display).
     pub status_message: Option<String>,
@@ -189,6 +194,7 @@ impl AppState {
             dialogs: DialogState::default(),
             current_file: None,
             dirty: false,
+            last_canvas_size: egui::Vec2::new(800.0, 600.0),
             status_message: None,
         }
     }

@@ -164,6 +164,7 @@ fn input_handle_pos(rect: Rect, kind: NodeKind) -> Option<Pos2> {
 /// Render the active diagram into the central panel and handle all interactions.
 pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     let panel_rect = ui.available_rect_before_wrap();
+    state.last_canvas_size = panel_rect.size();
 
     // Allocate the full panel as an interactive widget (primary-button click +
     // drag).  Middle-mouse events are read from global InputState directly.

@@ -431,6 +431,15 @@ fn action_auto_layout(state: &mut AppState) {
     match state.undo_stack.execute(Box::new(cmd), &mut state.project) {
         Ok(()) => {
             state.dirty = true;
+            // Centre the viewport on canvas (0, 0) — where the layout is centred.
+            // Transform: screen = (canvas - scroll) * zoom + origin
+            // For canvas (0,0) at panel centre: scroll = -(panel_size / 2) / zoom
+            if let Some(diagram) = state.project.diagram_mut(state.active_diagram_id) {
+                let zoom = diagram.viewport.zoom;
+                let half_w = state.last_canvas_size.x / 2.0;
+                let half_h = state.last_canvas_size.y / 2.0;
+                diagram.viewport.scroll = (-half_w / zoom, -half_h / zoom);
+            }
             state.set_status("Auto Layout applied.");
         }
         Err(e) => state.set_status(format!("Auto Layout failed: {e}")),
