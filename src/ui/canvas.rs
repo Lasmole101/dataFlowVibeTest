@@ -721,10 +721,6 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
         }
     });
 
-    // -----------------------------------------------------------------------
-    // Node palette window
-    // -----------------------------------------------------------------------
-    show_node_palette(state, ui.ctx());
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,31 +1436,3 @@ fn delete_node_with_streams(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Node palette window
-// ---------------------------------------------------------------------------
-
-/// Render the floating node palette and detect palette-drag starts.
-fn show_node_palette(state: &mut AppState, ctx: &egui::Context) {
-    egui::Window::new("Nodes")
-        .resizable(false)
-        .default_pos([8.0, 60.0])
-        .min_width(96.0)
-        .show(ctx, |ui| {
-            for kind in [NodeKind::Source, NodeKind::Sink, NodeKind::Process] {
-                let resp = ui.add(
-                    egui::Button::new(kind.label())
-                        .min_size(egui::vec2(88.0, 22.0))
-                        .sense(egui::Sense::click_and_drag()),
-                );
-                if resp.drag_started() {
-                    state.drag_state.palette_drag = Some(kind);
-                }
-                resp.on_hover_text(match kind {
-                    NodeKind::Source => "Drag onto canvas to create a Source node",
-                    NodeKind::Sink => "Drag onto canvas to create a Sink node",
-                    NodeKind::Process => "Drag onto canvas to create a Process node",
-                });
-            }
-        });
-}

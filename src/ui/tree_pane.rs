@@ -93,6 +93,27 @@ pub fn show(state: &mut AppState, ui: &mut Ui) {
                 ActivePanel::Dictionary
             };
         }
+
+        ui.separator();
+
+        // ── Node palette ─────────────────────────────────────────────────
+        ui.label("Add Node");
+        ui.add_space(2.0);
+        for kind in [NodeKind::Source, NodeKind::Sink, NodeKind::Process] {
+            let resp = ui.add(
+                egui::Button::new(kind.label())
+                    .min_size(egui::vec2(ui.available_width(), 22.0))
+                    .sense(egui::Sense::click_and_drag()),
+            );
+            if resp.drag_started() {
+                state.drag_state.palette_drag = Some(kind);
+            }
+            resp.on_hover_text(match kind {
+                NodeKind::Source => "Drag onto canvas to create a Source node",
+                NodeKind::Sink => "Drag onto canvas to create a Sink node",
+                NodeKind::Process => "Drag onto canvas to create a Process node",
+            });
+        }
     });
 
     // ── Rename dialog (inline — bypasses the todo!() stub) ──────────────

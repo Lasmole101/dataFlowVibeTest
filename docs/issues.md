@@ -1,4 +1,4 @@
-# Node creation panel
+# Node creation panel ✅
 
 The node creation should not be floating. Instead it should be a part of the left hand tree panel in its own section under the data dictionary.
 
