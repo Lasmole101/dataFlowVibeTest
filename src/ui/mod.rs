@@ -7,6 +7,7 @@
 pub mod canvas;
 pub mod dialogs;
 pub mod dictionary_panel;
+pub mod layout;
 pub mod spec_panel;
 pub mod toolbar;
 pub mod tree_pane;

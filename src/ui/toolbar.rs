@@ -412,11 +412,29 @@ fn action_full_validate(state: &mut AppState) {
     state.set_status(msg);
 }
 
-/// Trigger auto layout on the active diagram (Phase 8 stub).
+/// Run auto-layout on the active diagram and push the result as a single
+/// undoable compound command.
 fn action_auto_layout(state: &mut AppState) {
-    // Phase 8: implement orthogonal auto-layout and push a MoveNode compound
-    // command onto the undo stack.
-    state.set_status("Auto Layout — not yet implemented (Phase 8).");
+    let cmd = {
+        let Some(diagram) = state.project.diagram(state.active_diagram_id) else {
+            state.set_status("No active diagram.");
+            return;
+        };
+        crate::ui::layout::auto_layout_command(diagram)
+    };
+
+    if cmd.commands.is_empty() {
+        state.set_status("Nothing to layout.");
+        return;
+    }
+
+    match state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+        Ok(()) => {
+            state.dirty = true;
+            state.set_status("Auto Layout applied.");
+        }
+        Err(e) => state.set_status(format!("Auto Layout failed: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
