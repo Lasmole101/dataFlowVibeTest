@@ -8,8 +8,12 @@ The nodes should not have a there type on them as a label. They currently have t
 
 # Stream names
 
-Streams should be able to be named.
+Streams should be able to be named but have no name as a default.
 
 # Stream groups
 
 This is a missing feature detailed in SPEC.md
+
+# Sub-diagram updates
+
+When I add a new input to a process in a higher level diagram it's sub diagram does not get updated with a new boundary node.
