@@ -31,6 +31,7 @@
 
 use eframe::CreationContext;
 use egui::{Context, FontId, Pos2, RichText, Ui};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::{
@@ -139,6 +140,8 @@ pub struct AppState {
     // ---- Selection ----
     /// The currently selected component (node or stream UUID), if any.
     pub selected_id: Option<Uuid>,
+    /// Streams explicitly multi-selected (Ctrl+click) for group creation.
+    pub multi_selected_streams: HashSet<Uuid>,
 
     // ---- Panel state ----
     /// Which right-hand side panel is open.
@@ -186,6 +189,7 @@ impl AppState {
             validation: ValidationCache::default(),
             active_diagram_id: root_id,
             selected_id: None,
+            multi_selected_streams: HashSet::new(),
             active_panel: ActivePanel::None,
             tree_pane_width: 220.0,
             tree_pane_visible: true,
@@ -282,6 +286,7 @@ impl eframe::App for AppState {
         // The tree pane may open the set-subdiagram dialog; handle it here
         // so it floats over the full window.
         render_set_subdiagram_dialog(self, ctx);
+        render_create_group_dialog(self, ctx);
     }
 }
 
@@ -355,6 +360,62 @@ fn render_right_panel(state: &mut AppState, ui: &mut Ui) {
 /// Renders the central canvas area — delegates to [`crate::ui::canvas::show`].
 fn render_canvas_placeholder(state: &mut AppState, ui: &mut Ui) {
     crate::ui::canvas::show(state, ui);
+}
+
+/// Generate a random saturated colour for a new stream group.
+///
+/// Uses the first two bytes of a fresh v4 UUID as a random hue source,
+/// with fixed saturation (0.75) and lightness (0.55) so the result is vivid
+/// and readable on both light and dark backgrounds.
+fn random_group_color() -> [u8; 3] {
+    let hue = (Uuid::new_v4().as_bytes()[0] as f32 / 255.0) * 360.0;
+    let s = 0.75_f32;
+    let l = 0.55_f32;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((hue / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = if hue < 60.0 {
+        (c, x, 0.0_f32)
+    } else if hue < 120.0 {
+        (x, c, 0.0)
+    } else if hue < 180.0 {
+        (0.0, c, x)
+    } else if hue < 240.0 {
+        (0.0, x, c)
+    } else if hue < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    [
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    ]
+}
+
+/// "Create Stream Group" dialog — dispatches [`crate::undo::commands::CreateStreamGroup`] on confirm.
+fn render_create_group_dialog(state: &mut AppState, ctx: &Context) {
+    match state.dialogs.create_group.show(ctx) {
+        crate::ui::dialogs::DialogResult::Confirmed(name) => {
+            let stream_ids = state.dialogs.create_group.candidate_stream_ids.clone();
+            let group_id = Uuid::new_v4();
+            let cmd = crate::undo::commands::CreateStreamGroup {
+                diagram_id: state.active_diagram_id,
+                name,
+                stream_ids,
+                group_id,
+                color: random_group_color(),
+            };
+            if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+                state.set_status(format!("Create group failed: {e}"));
+            } else {
+                state.dirty = true;
+            }
+        }
+        crate::ui::dialogs::DialogResult::Cancelled
+        | crate::ui::dialogs::DialogResult::Pending => {}
+    }
 }
 
 /// "Set Sub-diagram" dialog — delegates to [`crate::ui::dialogs::SetSubDiagramDialog::show`].

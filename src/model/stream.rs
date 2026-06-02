@@ -139,6 +139,11 @@ pub struct StreamGroup {
     ///
     /// Invariant: no duplicates.
     pub member_stream_ids: Vec<Uuid>,
+    /// Display colour assigned at group creation — RGB bytes.
+    /// Default is a neutral grey `[140, 140, 155]` for groups loaded from old
+    /// files that pre-date the colour field.
+    #[serde(default = "StreamGroup::default_color")]
+    pub color: [u8; 3],
 }
 
 impl StreamGroup {
@@ -146,9 +151,15 @@ impl StreamGroup {
     // Constructor
     // -----------------------------------------------------------------------
 
+    pub(crate) fn default_color() -> [u8; 3] {
+        [140, 140, 155]
+    }
+
     /// Create a new group from an initial (non-empty) set of stream IDs.
     ///
     /// Duplicate IDs in `member_stream_ids` are silently deduplicated.
+    /// The display colour defaults to grey; set `group.color` afterwards to
+    /// assign the intended colour.
     pub fn new(name: impl Into<String>, member_stream_ids: Vec<Uuid>) -> Self {
         // Deduplicate while preserving order.
         let mut seen = std::collections::HashSet::new();
@@ -160,6 +171,7 @@ impl StreamGroup {
             id: Uuid::new_v4(),
             name: name.into(),
             member_stream_ids: deduped,
+            color: Self::default_color(),
         }
     }
 
