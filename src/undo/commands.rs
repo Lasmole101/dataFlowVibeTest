@@ -224,31 +224,45 @@ pub struct EditNodeSpec {
 
 impl Command for EditNodeSpec {
     fn apply(&self, project: &mut crate::model::project::Project) -> Result<(), CommandError> {
-        let diagram = project
-            .diagram_mut(self.diagram_id)
-            .ok_or_else(|| diagram_err(self.diagram_id))?;
-        let node = diagram
-            .nodes
-            .get_mut(&self.node_id)
-            .ok_or_else(|| node_err(self.node_id))?;
-        match self.side {
-            NodeSpecSide::Input => node.input_spec = self.after.clone(),
-            NodeSpecSide::Output => node.output_spec = self.after.clone(),
+        let sub_diagram_id = {
+            let diagram = project
+                .diagram_mut(self.diagram_id)
+                .ok_or_else(|| diagram_err(self.diagram_id))?;
+            let node = diagram
+                .nodes
+                .get_mut(&self.node_id)
+                .ok_or_else(|| node_err(self.node_id))?;
+            match self.side {
+                NodeSpecSide::Input => node.input_spec = self.after.clone(),
+                NodeSpecSide::Output => node.output_spec = self.after.clone(),
+            }
+            node.sub_diagram_id
+        };
+        // Process I/O just changed — propagate to the sub-diagram's boundary
+        // nodes (spec §6.3 top-down propagation) if one is attached.
+        if let Some(sub_id) = sub_diagram_id {
+            project.update_boundary_nodes(sub_id).map_err(|e| err(e))?;
         }
         Ok(())
     }
 
     fn undo(&self, project: &mut crate::model::project::Project) -> Result<(), CommandError> {
-        let diagram = project
-            .diagram_mut(self.diagram_id)
-            .ok_or_else(|| diagram_err(self.diagram_id))?;
-        let node = diagram
-            .nodes
-            .get_mut(&self.node_id)
-            .ok_or_else(|| node_err(self.node_id))?;
-        match self.side {
-            NodeSpecSide::Input => node.input_spec = self.before.clone(),
-            NodeSpecSide::Output => node.output_spec = self.before.clone(),
+        let sub_diagram_id = {
+            let diagram = project
+                .diagram_mut(self.diagram_id)
+                .ok_or_else(|| diagram_err(self.diagram_id))?;
+            let node = diagram
+                .nodes
+                .get_mut(&self.node_id)
+                .ok_or_else(|| node_err(self.node_id))?;
+            match self.side {
+                NodeSpecSide::Input => node.input_spec = self.before.clone(),
+                NodeSpecSide::Output => node.output_spec = self.before.clone(),
+            }
+            node.sub_diagram_id
+        };
+        if let Some(sub_id) = sub_diagram_id {
+            project.update_boundary_nodes(sub_id).map_err(|e| err(e))?;
         }
         Ok(())
     }
