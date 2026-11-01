@@ -374,9 +374,14 @@ fn write_groups<W: Write>(w: &mut Writer<W>, diag: &Diagram) -> Result<(), Persi
 
     for group in groups {
         let gid_str = group.id.hyphenated().to_string();
+        let color_str = format!(
+            "{:02x}{:02x}{:02x}",
+            group.color[0], group.color[1], group.color[2]
+        );
         let mut el = BytesStart::new(EL_GROUP);
         el.push_attribute((ATTR_ID, gid_str.as_str()));
         el.push_attribute((ATTR_NAME, group.name.as_str()));
+        el.push_attribute((ATTR_COLOR, color_str.as_str()));
 
         if group.member_stream_ids.is_empty() {
             w.write_event(Event::Empty(el))?;
@@ -833,8 +838,10 @@ impl<'a> Loader<'a> {
                 Event::Empty(ref e) if e.name().as_ref() == EL_GROUP.as_bytes() => {
                     let id = parse_uuid(&req_attr(e, ATTR_ID)?)?;
                     let name = req_attr(e, ATTR_NAME)?;
+                    let color = parse_color_opt(opt_attr(e, ATTR_COLOR)?);
                     let mut g = StreamGroup::new(name, vec![]);
                     g.id = id;
+                    g.color = color;
                     groups.insert(id, g);
                 }
                 Event::End(ref e) if e.name().as_ref() == EL_GROUPS.as_bytes() => break,
@@ -852,6 +859,7 @@ impl<'a> Loader<'a> {
     fn parse_group(&mut self, start: &BytesStart) -> Result<StreamGroup, PersistenceError> {
         let id = parse_uuid(&req_attr(start, ATTR_ID)?)?;
         let name = req_attr(start, ATTR_NAME)?;
+        let color = parse_color_opt(opt_attr(start, ATTR_COLOR)?);
         let mut members: Vec<Uuid> = Vec::new();
         let mut buf = Vec::new();
 
@@ -874,6 +882,7 @@ impl<'a> Loader<'a> {
 
         let mut g = StreamGroup::new(name, members);
         g.id = id;
+        g.color = color;
         Ok(g)
     }
 
@@ -1077,6 +1086,22 @@ fn opt_attr(e: &BytesStart, name: &str) -> Result<Option<String>, PersistenceErr
         }
     }
     Ok(None)
+}
+
+/// Parse an optional hex-RGB colour attribute (e.g. `"ff8040"`) into `[u8; 3]`.
+/// Returns the default grey when the attribute is absent or malformed.
+fn parse_color_opt(raw: Option<String>) -> [u8; 3] {
+    raw.and_then(|s| {
+        if s.len() == 6 {
+            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+            Some([r, g, b])
+        } else {
+            None
+        }
+    })
+    .unwrap_or_else(crate::model::stream::StreamGroup::default_color)
 }
 
 fn parse_uuid(s: &str) -> Result<Uuid, PersistenceError> {

@@ -410,6 +410,10 @@ pub const ATTR_IS_DANGLING: &str = "is_dangling";
 /// `stream_id` — UUID reference on a `<member>` element inside a `<group>`.
 pub const ATTR_STREAM_ID: &str = "stream_id";
 
+/// `color` — hex RGB color (e.g. `"ff8040"`) assigned to a stream group.
+/// Omitted for old files; readers fall back to a default grey.
+pub const ATTR_COLOR: &str = "color";
+
 /// `count` — instance count on an `<entry>` element (positive integer).
 pub const ATTR_COUNT: &str = "count";
 

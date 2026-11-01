@@ -22,7 +22,7 @@
 //! 3. Node body hit (not near a handle) → start node drag
 //! Palette drag is detected separately in the floating palette window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, CursorIcon, FontId, Painter, Pos2, Rect, Rounding, Stroke, Vec2};
 use uuid::Uuid;
@@ -35,7 +35,10 @@ use crate::{
         stream::Stream,
     },
     undo::{
-        commands::{AddNode, AddStream, CreateSubDiagram, DeleteNode, DeleteStream, MoveNode},
+        commands::{
+            AddNode, AddStream, CreateSubDiagram, DeleteNode, DeleteStream, DeleteStreamGroup,
+            EditStreamGroup, MoveNode,
+        },
         history::CompoundCommand,
     },
     validation::validator::ValidationState,
@@ -63,7 +66,7 @@ const STREAM_STROKE: f32 = 1.5;
 /// Arrowhead size (half-width of the arrowhead triangle).
 const ARROW_HALF: f32 = 6.0;
 /// Perpendicular offset per slot for grouped streams.
-const GROUP_OFFSET: f32 = 5.0;
+const GROUP_OFFSET: f32 = 7.5;
 
 /// Badge circle radius.
 const BADGE_R: f32 = 6.0;
@@ -73,6 +76,8 @@ const AMBER: Color32 = Color32::from_rgb(220, 170, 50);
 const ERROR_RED: Color32 = Color32::from_rgb(220, 70, 70);
 /// Selection highlight colour.
 const SELECT_COLOR: Color32 = Color32::from_rgb(80, 180, 255);
+/// Multi-selection highlight colour (amber, used when streams are Ctrl+clicked for grouping).
+const MULTI_SELECT_COLOR: Color32 = Color32::from_rgb(255, 170, 50);
 /// Tolerance (screen pixels) for clicking a stream polyline.
 const STREAM_HIT_TOLERANCE: f32 = 6.0;
 /// Zoom step per one scroll-wheel notch (120 scroll units).
@@ -486,6 +491,7 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
         state.drag_state.palette_drag = None;
         state.drag_state.creating_stream = None;
         state.drag_state.reconnecting_stream = None;
+        state.multi_selected_streams.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -498,14 +504,36 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
 
     if !dragging_anything {
         let interact_pos = ui.input(|i| i.pointer.interact_pos());
+        let ctrl_held = ui.input(|i| i.modifiers.ctrl);
         if response.double_clicked() {
             let hit = interact_pos.and_then(|p| hit_test(&draw_data, p));
             state.selected_id = hit;
+            state.multi_selected_streams.clear();
             if let Some(id) = hit {
                 state.active_panel = ActivePanel::Spec(id);
             }
         } else if response.clicked() {
-            state.selected_id = interact_pos.and_then(|p| hit_test(&draw_data, p));
+            let hit = interact_pos.and_then(|p| hit_test(&draw_data, p));
+            if ctrl_held {
+                if let Some(id) = hit {
+                    if diagram.streams.contains_key(&id) {
+                        // Toggle stream in the multi-select set.
+                        if state.multi_selected_streams.contains(&id) {
+                            state.multi_selected_streams.remove(&id);
+                        } else {
+                            state.multi_selected_streams.insert(id);
+                        }
+                    } else {
+                        // Ctrl+click on a node: normal select, clear multi-select.
+                        state.selected_id = Some(id);
+                        state.multi_selected_streams.clear();
+                    }
+                }
+                // Ctrl+click on empty canvas: no change.
+            } else {
+                state.selected_id = hit;
+                state.multi_selected_streams.clear();
+            }
         }
     }
 
@@ -554,7 +582,7 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     // -----------------------------------------------------------------------
     // Sync selection into draw data (after all interactions that may change it)
     // -----------------------------------------------------------------------
-    mark_selected(&mut draw_data, state.selected_id);
+    mark_selected(&mut draw_data, state.selected_id, &state.multi_selected_streams);
 
     // -----------------------------------------------------------------------
     // Write back viewport if it changed this frame
@@ -588,7 +616,7 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     draw_grid(&painter, panel_rect, &xform, dark_mode);
 
     for sd in &draw_data.streams {
-        draw_stream(&painter, sd, dark_mode, &draw_data.group_offsets);
+        draw_stream(&painter, sd, dark_mode);
     }
     for nd in &draw_data.nodes {
         draw_node(&painter, nd, dark_mode);
@@ -602,8 +630,19 @@ pub fn show(state: &mut AppState, ui: &mut egui::Ui) {
     }
     for sd in &draw_data.streams {
         if sd.selected {
-            draw_stream_selection(&painter, sd, &draw_data.group_offsets);
+            draw_stream_selection(&painter, sd);
         }
+    }
+    // Multi-selection highlights (amber) for streams Ctrl+clicked for group creation.
+    for sd in &draw_data.streams {
+        if sd.multi_selected && !sd.selected {
+            draw_stream_multi_selection(&painter, sd);
+        }
+    }
+
+    // Group name labels (above selection highlights, below badges).
+    for gl in &draw_data.group_labels {
+        draw_group_label(&painter, gl, dark_mode);
     }
 
     // Validation badges.
@@ -770,14 +809,31 @@ struct StreamDrawData {
     points: Vec<Pos2>,
     midpoint: Pos2,
     badge: ValidationState,
-    group_id: Option<Uuid>,
+    /// Pre-computed perpendicular display offset (screen pixels).
+    /// Accounts for group membership AND ungrouped co-incident streams sharing
+    /// the same source/target pair so every stream is individually clickable.
+    display_offset: Vec2,
+    /// Group colour, set for streams that belong to a named group.
+    group_color: Option<Color32>,
     selected: bool,
+    multi_selected: bool,
+}
+
+struct GroupLabelDrawData {
+    name: String,
+    /// Screen position of the first (slot-0) stream at its path midpoint.
+    bracket_a: Pos2,
+    /// Screen position of the last stream at its path midpoint.
+    bracket_b: Pos2,
+    /// Where to draw the name text (just beyond bracket_b).
+    label_pos: Pos2,
+    color: Color32,
 }
 
 pub(crate) struct DiagramDrawData {
     nodes: Vec<NodeDrawData>,
     streams: Vec<StreamDrawData>,
-    group_offsets: HashMap<Uuid, Vec<Uuid>>,
+    group_labels: Vec<GroupLabelDrawData>,
 }
 
 // ---------------------------------------------------------------------------
@@ -789,11 +845,6 @@ fn collect_draw_data(
     xform: &Transform,
     drag_pos_override: Option<(Uuid, (f32, f32))>,
 ) -> DiagramDrawData {
-    let mut group_offsets: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-    for (gid, group) in &diagram.stream_groups {
-        group_offsets.insert(*gid, group.member_stream_ids.clone());
-    }
-
     let node_rects: HashMap<Uuid, Rect> = diagram
         .nodes
         .keys()
@@ -837,19 +888,140 @@ fn collect_draw_data(
             let src_rect = node_rects.get(&stream.source_node_id).copied();
             let tgt_rect = node_rects.get(&stream.target_node_id).copied();
             let (points, midpoint) = compute_stream_path(src_rect, tgt_rect);
+            let group_color = stream
+                .group_id
+                .and_then(|gid| diagram.stream_groups.get(&gid))
+                .map(|g| Color32::from_rgb(g.color[0], g.color[1], g.color[2]));
             StreamDrawData {
                 stream_id: stream.id,
                 points,
                 midpoint,
                 badge: ValidationState::Ok,
-                group_id: stream.group_id,
+                display_offset: Vec2::ZERO,
+                group_color,
                 selected: false,
+                multi_selected: false,
             }
         })
         .collect();
     streams.sort_by_key(|s| s.stream_id);
 
-    DiagramDrawData { nodes, streams, group_offsets }
+    // Build an index for O(1) stream lookup by ID.
+    let stream_idx: HashMap<Uuid, usize> =
+        streams.iter().enumerate().map(|(i, s)| (s.stream_id, i)).collect();
+
+    // Compute per-stream perpendicular display offsets in a single unified pass
+    // per (src, tgt) path.  Groups are assigned contiguous slots (sorted by
+    // group ID for determinism) so their streams always appear adjacent.
+    // Ungrouped co-incident streams get the remaining slots after all groups.
+    let mut path_streams: HashMap<(Uuid, Uuid), Vec<Uuid>> = HashMap::new();
+    for stream in diagram.streams.values() {
+        path_streams
+            .entry((stream.source_node_id, stream.target_node_id))
+            .or_default()
+            .push(stream.id);
+    }
+
+    let all_group_ids: Vec<Uuid> = {
+        let mut v: Vec<Uuid> = diagram.stream_groups.keys().copied().collect();
+        v.sort();
+        v
+    };
+
+    for sids in path_streams.values() {
+        if sids.len() <= 1 {
+            continue;
+        }
+        // Groups that have at least one member on this path, in sorted order.
+        let groups_on_path: Vec<Uuid> = all_group_ids
+            .iter()
+            .copied()
+            .filter(|gid| {
+                diagram
+                    .stream_groups
+                    .get(gid)
+                    .map_or(false, |g| g.member_stream_ids.iter().any(|s| sids.contains(s)))
+            })
+            .collect();
+
+        // Ordered slot list: grouped streams first (group order, then member order),
+        // then ungrouped streams sorted by ID.
+        let mut ordered: Vec<Uuid> = Vec::new();
+        for gid in &groups_on_path {
+            if let Some(g) = diagram.stream_groups.get(gid) {
+                for &sid in &g.member_stream_ids {
+                    if sids.contains(&sid) {
+                        ordered.push(sid);
+                    }
+                }
+            }
+        }
+        let grouped_set: HashSet<Uuid> = ordered.iter().copied().collect();
+        let mut ungrouped: Vec<Uuid> =
+            sids.iter().copied().filter(|s| !grouped_set.contains(s)).collect();
+        ungrouped.sort();
+        ordered.extend(ungrouped);
+
+        let n = ordered.len() as f32;
+        for (slot, &sid) in ordered.iter().enumerate() {
+            if let Some(&idx) = stream_idx.get(&sid) {
+                let offset = {
+                    let sd = &streams[idx];
+                    if sd.points.len() >= 2 {
+                        let seg_dir = (sd.points[1] - sd.points[0]).normalized();
+                        let perp = Vec2::new(-seg_dir.y, seg_dir.x);
+                        let centred = slot as f32 - (n - 1.0) * 0.5;
+                        perp * (centred * GROUP_OFFSET)
+                    } else {
+                        Vec2::ZERO
+                    }
+                };
+                streams[idx].display_offset = offset;
+            }
+        }
+    }
+
+    // Build group labels as a bracket spanning all member stream positions at
+    // 1/4 of the way along each stream's path.
+    let mut group_labels: Vec<GroupLabelDrawData> = Vec::new();
+    for group in diagram.stream_groups.values() {
+        let n = group.member_stream_ids.len();
+        if n == 0 {
+            continue;
+        }
+        let positions: Vec<Pos2> = group
+            .member_stream_ids
+            .iter()
+            .filter_map(|&sid| {
+                stream_idx
+                    .get(&sid)
+                    .map(|&i| path_at_t(&streams[i].points, 0.25) + streams[i].display_offset)
+            })
+            .collect();
+        if positions.is_empty() {
+            continue;
+        }
+        let bracket_a = positions[0];
+        let bracket_b = *positions.last().unwrap();
+        // Extend beyond the last stream in the cross-stream direction for the name.
+        let span = bracket_b - bracket_a;
+        let ext_dir = if span.length() > 1.0 {
+            span.normalized()
+        } else {
+            Vec2::new(0.0, -1.0)
+        };
+        let label_pos = bracket_b + ext_dir * 18.0;
+        let color = Color32::from_rgb(group.color[0], group.color[1], group.color[2]);
+        group_labels.push(GroupLabelDrawData {
+            name: group.name.clone(),
+            bracket_a,
+            bracket_b,
+            label_pos,
+            color,
+        });
+    }
+
+    DiagramDrawData { nodes, streams, group_labels }
 }
 
 /// Attach validation badge states — separate pass to keep collect_draw_data
@@ -863,17 +1035,18 @@ pub(crate) fn apply_badges(data: &mut DiagramDrawData, state: &AppState) {
     }
 }
 
-/// Set the `selected` flag on the draw-data entry matching `selected_id`.
-fn mark_selected(data: &mut DiagramDrawData, selected_id: Option<Uuid>) {
-    let id = match selected_id {
-        Some(id) => id,
-        None => return,
-    };
+/// Set the `selected` and `multi_selected` flags on draw-data entries.
+fn mark_selected(
+    data: &mut DiagramDrawData,
+    selected_id: Option<Uuid>,
+    multi_selected: &HashSet<Uuid>,
+) {
     for nd in &mut data.nodes {
-        nd.selected = nd.node_id == id;
+        nd.selected = selected_id == Some(nd.node_id);
     }
     for sd in &mut data.streams {
-        sd.selected = sd.stream_id == id;
+        sd.selected = selected_id == Some(sd.stream_id);
+        sd.multi_selected = multi_selected.contains(&sd.stream_id);
     }
 }
 
@@ -890,7 +1063,8 @@ fn hit_test(draw_data: &DiagramDrawData, pos: Pos2) -> Option<Uuid> {
         }
     }
     for sd in &draw_data.streams {
-        if hit_test_polyline(pos, &sd.points, STREAM_HIT_TOLERANCE) {
+        let shifted: Vec<Pos2> = sd.points.iter().map(|&p| p + sd.display_offset).collect();
+        if hit_test_polyline(pos, &shifted, STREAM_HIT_TOLERANCE) {
             return Some(sd.stream_id);
         }
     }
@@ -1018,6 +1192,28 @@ fn next_node_name(diagram: &Diagram, kind: NodeKind) -> String {
 // ---------------------------------------------------------------------------
 // Stream path computation
 // ---------------------------------------------------------------------------
+
+/// Return the point at fraction `t` (0 = start, 1 = end) along a polyline by arc length.
+fn path_at_t(points: &[Pos2], t: f32) -> Pos2 {
+    if points.len() < 2 {
+        return points.first().copied().unwrap_or(Pos2::ZERO);
+    }
+    let total: f32 = points.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+    if total < f32::EPSILON {
+        return points[0];
+    }
+    let target = t.clamp(0.0, 1.0) * total;
+    let mut walked = 0.0_f32;
+    for w in points.windows(2) {
+        let seg_len = (w[1] - w[0]).length();
+        if walked + seg_len >= target {
+            let frac = if seg_len > f32::EPSILON { (target - walked) / seg_len } else { 0.0 };
+            return w[0].lerp(w[1], frac);
+        }
+        walked += seg_len;
+    }
+    *points.last().unwrap()
+}
 
 fn compute_stream_path(src_rect: Option<Rect>, tgt_rect: Option<Rect>) -> (Vec<Pos2>, Pos2) {
     let (src_r, tgt_r) = match (src_rect, tgt_rect) {
@@ -1190,15 +1386,9 @@ fn draw_dashed_segment(painter: &Painter, a: Pos2, b: Pos2, stroke: Stroke, dash
 // Stream drawing
 // ---------------------------------------------------------------------------
 
-fn draw_stream(
-    painter: &Painter,
-    sd: &StreamDrawData,
-    dark_mode: bool,
-    group_offsets: &HashMap<Uuid, Vec<Uuid>>,
-) {
-    let base_color = stream_color(dark_mode);
-    let offset_vec = stream_offset(sd, group_offsets);
-    let points: Vec<Pos2> = sd.points.iter().map(|&p| p + offset_vec).collect();
+fn draw_stream(painter: &Painter, sd: &StreamDrawData, dark_mode: bool) {
+    let base_color = sd.group_color.unwrap_or_else(|| stream_color(dark_mode));
+    let points: Vec<Pos2> = sd.points.iter().map(|&p| p + sd.display_offset).collect();
     if points.len() < 2 {
         return;
     }
@@ -1213,25 +1403,47 @@ fn draw_stream(
     }
 }
 
-fn draw_stream_selection(
-    painter: &Painter,
-    sd: &StreamDrawData,
-    group_offsets: &HashMap<Uuid, Vec<Uuid>>,
-) {
-    let offset_vec = stream_offset(sd, group_offsets);
-    let points: Vec<Pos2> = sd.points.iter().map(|&p| p + offset_vec).collect();
+fn draw_stream_selection(painter: &Painter, sd: &StreamDrawData) {
+    let points: Vec<Pos2> = sd.points.iter().map(|&p| p + sd.display_offset).collect();
     let stroke = Stroke::new(STREAM_STROKE + 2.0, SELECT_COLOR);
     for window in points.windows(2) {
         painter.line_segment([window[0], window[1]], stroke);
     }
 }
 
-fn stream_offset(sd: &StreamDrawData, group_offsets: &HashMap<Uuid, Vec<Uuid>>) -> Vec2 {
-    if let Some(gid) = sd.group_id {
-        compute_group_offset(sd.stream_id, gid, group_offsets, &sd.points)
-    } else {
-        Vec2::ZERO
+fn draw_stream_multi_selection(painter: &Painter, sd: &StreamDrawData) {
+    let points: Vec<Pos2> = sd.points.iter().map(|&p| p + sd.display_offset).collect();
+    let stroke = Stroke::new(STREAM_STROKE + 2.0, MULTI_SELECT_COLOR);
+    for window in points.windows(2) {
+        painter.line_segment([window[0], window[1]], stroke);
     }
+}
+
+fn draw_group_label(painter: &Painter, gl: &GroupLabelDrawData, _dark_mode: bool) {
+    let color = gl.color;
+    // Draw a bracket line spanning the bundle width (skip if single-stream group).
+    let span = gl.bracket_b - gl.bracket_a;
+    if span.length() > 2.0 {
+        painter.line_segment([gl.bracket_a, gl.bracket_b], Stroke::new(1.5, color));
+        // Small end ticks perpendicular to the bracket.
+        let dir = span.normalized();
+        let tick = Vec2::new(-dir.y, dir.x) * 4.0;
+        painter.line_segment(
+            [gl.bracket_a - tick, gl.bracket_a + tick],
+            Stroke::new(1.0, color),
+        );
+        painter.line_segment(
+            [gl.bracket_b - tick, gl.bracket_b + tick],
+            Stroke::new(1.0, color),
+        );
+    }
+    painter.text(
+        gl.label_pos,
+        egui::Align2::LEFT_CENTER,
+        &gl.name,
+        FontId::proportional(10.0),
+        color,
+    );
 }
 
 fn draw_arrowhead(painter: &Painter, from: Pos2, tip: Pos2, half: f32, color: Color32) {
@@ -1245,25 +1457,6 @@ fn draw_arrowhead(painter: &Painter, from: Pos2, tip: Pos2, half: f32, color: Co
     ));
 }
 
-fn compute_group_offset(
-    stream_id: Uuid,
-    group_id: Uuid,
-    group_offsets: &HashMap<Uuid, Vec<Uuid>>,
-    points: &[Pos2],
-) -> Vec2 {
-    let members = match group_offsets.get(&group_id) {
-        Some(m) => m,
-        None => return Vec2::ZERO,
-    };
-    let slot = members.iter().position(|&id| id == stream_id).unwrap_or(0) as f32;
-    let n = members.len() as f32;
-    let centred_slot = slot - (n - 1.0) * 0.5;
-    if points.len() < 2 {
-        return Vec2::ZERO;
-    }
-    let seg_dir = (points[1] - points[0]).normalized();
-    Vec2::new(-seg_dir.y, seg_dir.x) * (centred_slot * GROUP_OFFSET)
-}
 
 // ---------------------------------------------------------------------------
 // Badge drawing
@@ -1385,8 +1578,63 @@ fn show_stream_context_menu(
     };
     let src_id = stream.source_node_id;
     let tgt_id = stream.target_node_id;
+    let stream_group_id = stream.group_id;
     let stream_clone = stream.clone();
 
+    // ── Create group ──────────────────────────────────────────────────────
+    // Shown when this stream is part of a Ctrl+click multi-selection (≥2).
+    let show_create_group = state.multi_selected_streams.contains(&stream_id)
+        && state.multi_selected_streams.len() >= 2;
+    let mut do_create_group = false;
+    if show_create_group {
+        if ui
+            .button(format!(
+                "Create group ({} streams)",
+                state.multi_selected_streams.len()
+            ))
+            .clicked()
+        {
+            do_create_group = true;
+            ui.close_menu();
+        }
+        ui.separator();
+    }
+
+    // ── Add to group ──────────────────────────────────────────────────────
+    // Shown when this stream is ungrouped and at least one group exists.
+    let candidate_groups: Vec<(Uuid, String)> = if stream_group_id.is_none() {
+        let mut gs: Vec<(Uuid, String)> = diagram
+            .stream_groups
+            .values()
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+        gs.sort_by(|a, b| a.1.cmp(&b.1));
+        gs
+    } else {
+        Vec::new()
+    };
+    let mut add_to_group_id: Option<Uuid> = None;
+    if !candidate_groups.is_empty() {
+        ui.menu_button("Add to group", |ui| {
+            for (gid, gname) in &candidate_groups {
+                if ui.button(gname.as_str()).clicked() {
+                    add_to_group_id = Some(*gid);
+                    ui.close_menu();
+                }
+            }
+        });
+    }
+
+    // ── Remove from group ─────────────────────────────────────────────────
+    let mut do_remove_from_group = false;
+    if stream_group_id.is_some() {
+        if ui.button("Remove from group").clicked() {
+            do_remove_from_group = true;
+            ui.close_menu();
+        }
+    }
+
+    // ── Standard items ────────────────────────────────────────────────────
     if ui.button("Open Spec").clicked() {
         state.selected_id = Some(stream_id);
         state.active_panel = ActivePanel::Spec(stream_id);
@@ -1406,6 +1654,66 @@ fn show_stream_context_menu(
             state.validation.validate_incremental(tgt_id, &state.project);
         }
         ui.close_menu();
+    }
+
+    // ── Deferred command dispatch ─────────────────────────────────────────
+    if do_create_group {
+        let ids: Vec<Uuid> = state.multi_selected_streams.iter().copied().collect();
+        state.dialogs.create_group.open_for(ids);
+        state.multi_selected_streams.clear();
+    }
+
+    if let Some(gid) = add_to_group_id {
+        if let Some(group) = diagram.stream_groups.get(&gid) {
+            let before = group.clone();
+            let mut after = group.clone();
+            after.add_stream(stream_id);
+            let cmd = EditStreamGroup {
+                diagram_id: state.active_diagram_id,
+                group_id: gid,
+                before,
+                after,
+            };
+            if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+                state.set_status(format!("Add to group failed: {e}"));
+            } else {
+                state.dirty = true;
+            }
+        }
+    }
+
+    if do_remove_from_group {
+        if let Some(gid) = stream_group_id {
+            if let Some(group) = diagram.stream_groups.get(&gid) {
+                if group.len() <= 1 {
+                    // Last member: dissolve the group entirely.
+                    let cmd = DeleteStreamGroup {
+                        diagram_id: state.active_diagram_id,
+                        group: group.clone(),
+                    };
+                    if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+                        state.set_status(format!("Remove from group failed: {e}"));
+                    } else {
+                        state.dirty = true;
+                    }
+                } else {
+                    let before = group.clone();
+                    let mut after = group.clone();
+                    after.remove_stream(stream_id);
+                    let cmd = EditStreamGroup {
+                        diagram_id: state.active_diagram_id,
+                        group_id: gid,
+                        before,
+                        after,
+                    };
+                    if let Err(e) = state.undo_stack.execute(Box::new(cmd), &mut state.project) {
+                        state.set_status(format!("Remove from group failed: {e}"));
+                    } else {
+                        state.dirty = true;
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -546,6 +546,7 @@ fn create_stream_group_undo_redo() {
             name: "G".into(),
             stream_ids: vec![sid],
             group_id: gid,
+            color: [140, 140, 155],
         },
         &mut p,
     );
@@ -763,6 +764,56 @@ fn create_sub_diagram_undo_removes_diagram_and_unlinks() {
     stack.undo(&mut p).unwrap();
     assert!(p.diagram(rid).unwrap().nodes[&pid].sub_diagram_id.is_none());
     assert_eq!(p.diagrams.len(), 1);
+}
+
+#[test]
+fn edit_node_spec_regenerates_sub_diagram_boundary_nodes() {
+    let mut stack = UndoStack::default();
+    let mut p = base_project();
+    p.data_dictionary
+        .add_primitive(PrimitiveType::new("float"))
+        .unwrap();
+    let rid = root_id(&p);
+
+    let mut proc = Node::new(NodeKind::Process, "P");
+    proc.input_spec.add(1, "int");
+    let pid = proc.id;
+    add_raw(&mut p, proc);
+    let sub_id = p.create_sub_diagram(rid, pid).unwrap();
+
+    let count_boundary_sources = |p: &Project| {
+        p.diagram(sub_id)
+            .unwrap()
+            .nodes
+            .values()
+            .filter(|n| n.is_boundary && n.kind == NodeKind::Source)
+            .count()
+    };
+    assert_eq!(count_boundary_sources(&p), 1);
+
+    let before = spec(&[(1, "int")]);
+    let after = spec(&[(1, "int"), (2, "float")]);
+
+    execute(
+        &mut stack,
+        EditNodeSpec {
+            diagram_id: rid,
+            node_id: pid,
+            side: NodeSpecSide::Input,
+            before: before.clone(),
+            after,
+        },
+        &mut p,
+    );
+    // The new input entry must have propagated into a second boundary
+    // Source in the sub-diagram — this is the fix: previously the process's
+    // own spec would update but the sub-diagram's boundary nodes stayed
+    // frozen at whatever create_sub_diagram originally generated.
+    assert_eq!(count_boundary_sources(&p), 2);
+
+    stack.undo(&mut p).unwrap();
+    assert_eq!(p.diagram(rid).unwrap().nodes[&pid].input_spec, before);
+    assert_eq!(count_boundary_sources(&p), 1);
 }
 
 #[test]

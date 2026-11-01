@@ -510,16 +510,33 @@ fn apply_spec_action(
     match result {
         Ok(()) => {
             state.dirty = true;
-            // Incremental validation: re-validate the changed component and
-            // its neighbours.
-            state.validation.validate_incremental(
-                match target {
-                    SpecTarget::NodeInput { node_id, .. } => node_id,
-                    SpecTarget::NodeOutput { node_id, .. } => node_id,
-                    SpecTarget::Stream { stream_id, .. } => stream_id,
-                },
-                &state.project,
-            );
+            // A node-spec edit may cascade into a sub-diagram's boundary
+            // nodes (see EditNodeSpec::apply), which live in a different
+            // diagram than the one incremental validation scopes to — so
+            // fall back to a full re-validation for those.
+            let cascades_to_subdiagram = match target {
+                SpecTarget::NodeInput { node_id, diagram_id }
+                | SpecTarget::NodeOutput { node_id, diagram_id } => state
+                    .project
+                    .diagram(diagram_id)
+                    .and_then(|d| d.nodes.get(&node_id))
+                    .is_some_and(|n| n.sub_diagram_id.is_some()),
+                SpecTarget::Stream { .. } => false,
+            };
+            if cascades_to_subdiagram {
+                state.validation.validate_full(&state.project);
+            } else {
+                // Incremental validation: re-validate the changed component
+                // and its neighbours.
+                state.validation.validate_incremental(
+                    match target {
+                        SpecTarget::NodeInput { node_id, .. } => node_id,
+                        SpecTarget::NodeOutput { node_id, .. } => node_id,
+                        SpecTarget::Stream { stream_id, .. } => stream_id,
+                    },
+                    &state.project,
+                );
+            }
         }
         Err(e) => {
             state.set_status(format!("Spec edit failed: {e}"));

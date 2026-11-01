@@ -224,31 +224,45 @@ pub struct EditNodeSpec {
 
 impl Command for EditNodeSpec {
     fn apply(&self, project: &mut crate::model::project::Project) -> Result<(), CommandError> {
-        let diagram = project
-            .diagram_mut(self.diagram_id)
-            .ok_or_else(|| diagram_err(self.diagram_id))?;
-        let node = diagram
-            .nodes
-            .get_mut(&self.node_id)
-            .ok_or_else(|| node_err(self.node_id))?;
-        match self.side {
-            NodeSpecSide::Input => node.input_spec = self.after.clone(),
-            NodeSpecSide::Output => node.output_spec = self.after.clone(),
+        let sub_diagram_id = {
+            let diagram = project
+                .diagram_mut(self.diagram_id)
+                .ok_or_else(|| diagram_err(self.diagram_id))?;
+            let node = diagram
+                .nodes
+                .get_mut(&self.node_id)
+                .ok_or_else(|| node_err(self.node_id))?;
+            match self.side {
+                NodeSpecSide::Input => node.input_spec = self.after.clone(),
+                NodeSpecSide::Output => node.output_spec = self.after.clone(),
+            }
+            node.sub_diagram_id
+        };
+        // Process I/O just changed — propagate to the sub-diagram's boundary
+        // nodes (spec §6.3 top-down propagation) if one is attached.
+        if let Some(sub_id) = sub_diagram_id {
+            project.update_boundary_nodes(sub_id).map_err(|e| err(e))?;
         }
         Ok(())
     }
 
     fn undo(&self, project: &mut crate::model::project::Project) -> Result<(), CommandError> {
-        let diagram = project
-            .diagram_mut(self.diagram_id)
-            .ok_or_else(|| diagram_err(self.diagram_id))?;
-        let node = diagram
-            .nodes
-            .get_mut(&self.node_id)
-            .ok_or_else(|| node_err(self.node_id))?;
-        match self.side {
-            NodeSpecSide::Input => node.input_spec = self.before.clone(),
-            NodeSpecSide::Output => node.output_spec = self.before.clone(),
+        let sub_diagram_id = {
+            let diagram = project
+                .diagram_mut(self.diagram_id)
+                .ok_or_else(|| diagram_err(self.diagram_id))?;
+            let node = diagram
+                .nodes
+                .get_mut(&self.node_id)
+                .ok_or_else(|| node_err(self.node_id))?;
+            match self.side {
+                NodeSpecSide::Input => node.input_spec = self.before.clone(),
+                NodeSpecSide::Output => node.output_spec = self.before.clone(),
+            }
+            node.sub_diagram_id
+        };
+        if let Some(sub_id) = sub_diagram_id {
+            project.update_boundary_nodes(sub_id).map_err(|e| err(e))?;
         }
         Ok(())
     }
@@ -375,6 +389,8 @@ pub struct CreateStreamGroup {
     /// The UUID that will be assigned to the created group.
     /// Pre-allocated so undo can remove it by the same ID.
     pub group_id: Uuid,
+    /// Display colour (RGB) pre-generated so redo reuses the same colour.
+    pub color: [u8; 3],
 }
 
 impl Command for CreateStreamGroup {
@@ -382,9 +398,10 @@ impl Command for CreateStreamGroup {
         let diagram = project
             .diagram_mut(self.diagram_id)
             .ok_or_else(|| diagram_err(self.diagram_id))?;
-        // Build the group with the pre-allocated ID.
+        // Build the group with the pre-allocated ID and colour.
         let mut group = StreamGroup::new(&self.name, self.stream_ids.clone());
         group.id = self.group_id;
+        group.color = self.color;
         for &sid in &self.stream_ids {
             if let Some(s) = diagram.streams.get_mut(&sid) {
                 s.set_group(self.group_id);
